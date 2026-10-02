@@ -31,6 +31,8 @@ Changelog
 - [inotify] Add support for the ``follow_symlink`` keyword argument. (`#1086 <https://github.com/gorakhargosh/watchdog/pull/1086>`__)
 - [utils] Fixed ``repr(EmptyDirectorySnapshot)``, before that it was throwing an ``AttributeError: 'EmptyDirectorySnapshot' object has no attribute '_stat_info'``.
 - [utils] Implemented ``len(DirectorySnapshotDiff)`` to return the total number of changes.
+- [utils] ``DirectorySnapshot`` now accepts ``exclude_dirs`` and ``case_sensitive`` keyword arguments to prune whole directory subtrees (matched against paths relative to the snapshot root) before entering them, so the directories are never traversed by ``listdir``. ``PollingEmitter`` accepts the same arguments and exposes ``set_exclude_dirs()`` to change the rules at runtime while explicitly rebuilding the comparison baseline, avoiding spurious file-deletion events.
+- [utils] Case-insensitive path matching (``case_sensitive=False``) now also lowercases the matched path, fixing uppercase names not matching lowercase patterns before Python 3.13.
 - [core] Fixed ``generate_sub_moved_events()`` corrupting paths when the directory name appears multiple times in the path. (`#1158 <https://github.com/gorakhargosh/watchdog/pull/1158>`__)
 - Thanks to our beloved contributors: @BoboTiG, @tybug, @Corentin-pro, @kirkhansen, @JoachimCoenen, @blitztide, @Skeletor-Pirate
 - [core] Call ``task_done()`` for the stop sentinel in ``dispatch_events()`` to prevent ``join()`` from hanging. (`#1159 <https://github.com/gorakhargosh/watchdog/pull/1159>`__)

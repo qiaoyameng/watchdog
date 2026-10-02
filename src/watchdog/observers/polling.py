@@ -61,16 +61,48 @@ class PollingEmitter(EventEmitter):
         event_filter: list[type[FileSystemEvent]] | None = None,
         stat: Callable[[str], os.stat_result] = os.stat,
         listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        exclude_dirs: list[str] | tuple[str, ...] | None = None,
+        case_sensitive: bool = True,
     ) -> None:
         super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
         self._snapshot: DirectorySnapshot = EmptyDirectorySnapshot()
         self._lock = threading.Lock()
-        self._take_snapshot: Callable[[], DirectorySnapshot] = lambda: DirectorySnapshot(
+        self._stat = stat
+        self._listdir = listdir
+        self._exclude_dirs = list(exclude_dirs) if exclude_dirs is not None else []
+        self._case_sensitive = case_sensitive
+
+    def _take_snapshot(self) -> DirectorySnapshot:
+        return DirectorySnapshot(
             self.watch.path,
             recursive=self.watch.is_recursive,
-            stat=stat,
-            listdir=listdir,
+            stat=self._stat,
+            listdir=self._listdir,
+            exclude_dirs=self._exclude_dirs,
+            case_sensitive=self._case_sensitive,
         )
+
+    def set_exclude_dirs(self, exclude_dirs: list[str] | tuple[str, ...] | None) -> None:
+        """Replace the directory pruning rules and explicitly rebuild the
+        comparison baseline.
+
+        The fresh snapshot is built with the candidate rules *before* anything
+        is committed, so files newly hidden by the rules are not reported as
+        deleted on the next poll. If building the snapshot fails (for example
+        because the watched directory disappeared or the patterns conflict),
+        the previous rules and baseline are left untouched and the exception is
+        propagated to the caller.
+        """
+        new_exclude_dirs = list(exclude_dirs) if exclude_dirs is not None else []
+        with self._lock:
+            previous_exclude_dirs = self._exclude_dirs
+            self._exclude_dirs = new_exclude_dirs
+            try:
+                new_snapshot = self._take_snapshot()
+            except Exception:
+                self._exclude_dirs = previous_exclude_dirs
+                raise
+            self._snapshot = new_snapshot
 
     def on_thread_start(self) -> None:
         self._snapshot = self._take_snapshot()

@@ -37,6 +37,8 @@ import os
 from stat import S_ISDIR
 from typing import TYPE_CHECKING
 
+from watchdog.utils.patterns import match_any_paths
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from typing import Any, Callable
@@ -235,6 +237,12 @@ class DirectorySnapshotDiff:
             Set to True only if you are sure you will always use the same device.
         :type ignore_device:
             :class:`bool`
+        :param exclude_dirs:
+            Glob patterns (relative to ``path``) of directories whose whole
+            subtree must be pruned during both snapshots.
+        :param case_sensitive:
+            ``True`` if the directory patterns are matched case-sensitively;
+            ``False`` otherwise.
         """
 
         def __init__(
@@ -245,12 +253,16 @@ class DirectorySnapshotDiff:
             stat: Callable[[str], os.stat_result] = os.stat,
             listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
             ignore_device: bool = False,
+            exclude_dirs: list[str] | tuple[str, ...] | None = None,
+            case_sensitive: bool = True,
         ) -> None:
             self.path = path
             self.recursive = recursive
             self.stat = stat
             self.listdir = listdir
             self.ignore_device = ignore_device
+            self.exclude_dirs = exclude_dirs
+            self.case_sensitive = case_sensitive
 
         def __enter__(self) -> None:
             self.pre_snapshot = self.get_snapshot()
@@ -269,6 +281,8 @@ class DirectorySnapshotDiff:
                 recursive=self.recursive,
                 stat=self.stat,
                 listdir=self.listdir,
+                exclude_dirs=self.exclude_dirs,
+                case_sensitive=self.case_sensitive,
             )
 
 
@@ -292,6 +306,14 @@ class DirectorySnapshot:
         for every entry in the directory tree.
     :param listdir:
         Use custom listdir function. For details see ``os.scandir``.
+    :param exclude_dirs:
+        Glob patterns (relative to ``path``) of directories whose whole
+        subtree must be pruned. Matching directories, and everything beneath
+        them, are never recorded in the snapshot and are never entered, so
+        ``listdir`` is never called on them.
+    :param case_sensitive:
+        ``True`` if the directory patterns are matched case-sensitively;
+        ``False`` otherwise.
     """
 
     def __init__(
@@ -301,10 +323,18 @@ class DirectorySnapshot:
         recursive: bool = True,
         stat: Callable[[str], os.stat_result] = os.stat,
         listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        exclude_dirs: list[str] | tuple[str, ...] | None = None,
+        case_sensitive: bool = True,
     ) -> None:
         self.recursive = recursive
         self.stat = stat
         self.listdir = listdir
+        self._root_path = path
+        # Directory pruning rules, evaluated against paths relative to ``path``
+        # *before* a directory is entered. Kept separate from any file-level
+        # filtering the caller might do on the resulting snapshot.
+        self.exclude_dirs = list(exclude_dirs) if exclude_dirs is not None else []
+        self.case_sensitive = case_sensitive
 
         self._stat_info: dict[bytes | str, os.stat_result] = {}
         self._inode_to_path: dict[tuple[int, int], bytes | str] = {}
@@ -334,15 +364,42 @@ class DirectorySnapshot:
         entries = []
         for p in paths:
             with contextlib.suppress(OSError):
-                entry = (p, self.stat(p))
-                entries.append(entry)
-                yield entry
+                st = self.stat(p)
+                # Directory pruning, separate from file filtering: the rule
+                # is evaluated *before* the directory is entered, so a pruned
+                # subtree never reaches ``listdir`` (nor the snapshot).
+                # Regular files are never pruned, even if their name matches.
+                if not (S_ISDIR(st.st_mode) and self._is_excluded_dir(p)):
+                    entries.append((p, st))
+                    yield p, st
 
         if self.recursive:
             for path, st in entries:
                 with contextlib.suppress(PermissionError):
                     if S_ISDIR(st.st_mode):
                         yield from self.walk(path)
+
+    def _is_excluded_dir(self, path: str) -> bool:
+        """Return ``True`` if the whole subtree rooted at ``path`` must be
+        skipped. Patterns are matched against the path relative to the snapshot
+        root, using the same glob semantics and case handling as the event
+        dispatch layer.
+        """
+        if not self.exclude_dirs:
+            return False
+        # The watched path may carry a trailing separator, which would make
+        # ``os.path.relpath`` produce a ``../``-based path. Patterns always
+        # match on ``/`` regardless of the platform separator.
+        root = self._root_path.rstrip(os.sep) or os.sep
+        relative_path = os.path.relpath(path, root).replace(os.sep, "/")
+        # ``match_any_paths`` returns False precisely when the path is rejected
+        # by one of the excluded patterns.
+        return not match_any_paths(
+            [relative_path],
+            included_patterns=["**"],
+            excluded_patterns=self.exclude_dirs,
+            case_sensitive=self.case_sensitive,
+        )
 
     @property
     def paths(self) -> set[bytes | str]:

@@ -12,6 +12,13 @@ from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff,
 from .shell import mkdir, mv, rm, touch
 
 
+class _NamedEntry:
+    """Minimal stand-in for an ``os.DirEntry``."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
 def wait():
     """
     Wait long enough for file/folder mtime to change. This is needed
@@ -218,3 +225,148 @@ def test_empty_snapshot(p):
     assert len(diff) == 4
     assert diff.files_created == [p("a")]
     assert sorted(diff.dirs_created) == sorted([p(""), p("b"), p("b", "c")])
+
+
+def _make_tree(join):
+    mkdir(join("cache"))
+    touch(join("cache", "artifact"))
+    mkdir(join("cache", "nested"))
+    touch(join("cache", "nested", "deep"))
+    mkdir(join("src"))
+    touch(join("src", "module.py"))
+
+
+class RecordingListdir:
+    """``os.scandir`` replacement recording every entered directory."""
+
+    def __init__(self, root):
+        self.root = root
+        self.visited = []
+
+    def __call__(self, path):
+        self.visited.append(os.path.relpath(path, self.root))
+        return os.scandir(path)
+
+
+def test_excluded_dirs_are_never_entered(p):
+    _make_tree(p)
+    listdir = RecordingListdir(p())
+
+    snapshot = DirectorySnapshot(p(""), exclude_dirs=["cache"], listdir=listdir)
+
+    assert "cache" not in listdir.visited
+    assert os.path.join("cache", "nested") not in listdir.visited
+
+    paths = {os.path.relpath(path, p()) for path in snapshot.paths}
+    # The excluded directory itself, and everything beneath it, is pruned.
+    assert "cache" not in paths
+    assert os.path.join("cache", "artifact") not in paths
+    assert os.path.join("cache", "nested") not in paths
+    assert os.path.join("cache", "nested", "deep") not in paths
+    # Sibling trees are walked normally.
+    assert os.path.join("src", "module.py") in paths
+
+
+def test_excluded_dirs_glob_pattern(p):
+    _make_tree(p)
+    listdir = RecordingListdir(p())
+
+    DirectorySnapshot(p(""), exclude_dirs=["**/nested"], listdir=listdir)
+
+    assert os.path.join("cache", "nested") not in listdir.visited
+    assert "cache" in listdir.visited
+
+
+def test_excluded_dirs_case_sensitive(p):
+    _make_tree(p)
+    mkdir(p("CACHE"))
+    touch(p("CACHE", "other"))
+
+    sensitive = DirectorySnapshot(p(""), exclude_dirs=["cache"])
+    assert p("CACHE", "other") in sensitive.paths
+    assert p("cache", "artifact") not in sensitive.paths
+
+    insensitive = DirectorySnapshot(p(""), exclude_dirs=["cache"], case_sensitive=False)
+    assert p("CACHE", "other") not in insensitive.paths
+    assert p("cache", "artifact") not in insensitive.paths
+
+
+def test_file_with_excluded_name_is_not_pruned(p):
+    # Pruning applies to directories only.
+    touch(p("cache"))
+    mkdir(p("dir"))
+    touch(p("dir", "cache"))
+
+    snapshot = DirectorySnapshot(p(""), exclude_dirs=["**/cache"])
+
+    assert p("cache") in snapshot.paths
+    assert p("dir", "cache") in snapshot.paths
+
+
+def test_changing_rules_without_rebuild_reports_deletions(p):
+    _make_tree(p)
+
+    ref = DirectorySnapshot(p(""))
+    new_snapshot = DirectorySnapshot(p(""), exclude_dirs=["cache"])
+
+    # Without rebuilding the baseline the hidden subtree looks deleted.
+    diff = DirectorySnapshotDiff(ref, new_snapshot)
+    assert p("cache") in diff.dirs_deleted
+    assert p("cache", "artifact") in diff.files_deleted
+    assert p("cache", "nested", "deep") in diff.files_deleted
+
+
+def test_changing_rules_with_baseline_rebuild_reports_nothing(p):
+    _make_tree(p)
+
+    DirectorySnapshot(p(""))
+    # Explicitly rebuild the comparison baseline with the new rules.
+    ref = DirectorySnapshot(p(""), exclude_dirs=["cache"])
+    new_snapshot = DirectorySnapshot(p(""), exclude_dirs=["cache"])
+
+    diff = DirectorySnapshotDiff(ref, new_snapshot)
+    assert diff.files_deleted == []
+    assert diff.files_created == []
+    assert diff.dirs_deleted == []
+    assert diff.dirs_created == []
+
+
+def test_relaxing_rules_with_rebuild_only_reports_creations(p):
+    _make_tree(p)
+
+    ref = DirectorySnapshot(p(""), exclude_dirs=["cache"])
+    new_snapshot = DirectorySnapshot(p(""))
+    diff = DirectorySnapshotDiff(ref, new_snapshot)
+
+    assert diff.files_deleted == []
+    assert p("cache") in diff.dirs_created
+    assert p("cache", "artifact") in diff.files_created
+    assert p("cache", "nested", "deep") in diff.files_created
+
+
+def test_excluded_dir_vanishing_between_stat_and_descent(p):
+    _make_tree(p)
+
+    def listdir(path):
+        # The directory survives ``stat`` but is gone (or no longer a
+        # directory) by the time its contents are requested.
+        if os.path.relpath(path, p()) == "cache":
+            raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
+        return os.scandir(path)
+
+    # The directory disappears right after the parent is listed; the missing
+    # subtree is simply absent instead of raising.
+    snapshot = DirectorySnapshot(p(""), exclude_dirs=["src"], listdir=listdir)
+    assert p("cache") in snapshot.paths
+    assert p("cache", "artifact") not in snapshot.paths
+
+
+def test_excluded_dirs_context_manager(p):
+    _make_tree(p)
+
+    cm = DirectorySnapshotDiff.ContextManager(p(""), exclude_dirs=["cache"])
+    with cm:
+        touch(p("cache", "later"))
+
+    assert cm.diff.files_created == []
+    assert p("cache", "later") not in cm.post_snapshot.paths

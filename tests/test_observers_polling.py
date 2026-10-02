@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 from queue import Empty, Queue
 from time import sleep
 
@@ -155,3 +157,161 @@ def test_delete_watched_dir(event_queue, emitter):
             break
 
     assert expected == got
+
+
+def _drain(event_queue):
+    events = []
+    while True:
+        try:
+            events.append(event_queue.get_nowait()[0])
+        except Empty:
+            break
+    return events
+
+
+def test_polling_emitter_excludes_directory_subtree():
+    tmp = tempfile.mkdtemp()
+    try:
+        os.mkdir(os.path.join(tmp, "cache"))
+        open(os.path.join(tmp, "cache", "artifact"), "w").close()
+        open(os.path.join(tmp, "tracked"), "w").close()
+
+        visited = []
+
+        def recording_listdir(path):
+            visited.append(path)
+            return os.scandir(path)
+
+        event_queue = Queue()
+        watch = ObservedWatch(tmp, recursive=True)
+        emitter = Emitter(
+            event_queue, watch, timeout=0.05, listdir=recording_listdir, exclude_dirs=["cache"]
+        )
+        emitter.start()
+        try:
+            sleep(SLEEP_TIME)
+            assert os.path.join(tmp, "cache") not in visited
+
+            open(os.path.join(tmp, "cache", "later"), "w").close()
+            sleep(SLEEP_TIME)
+            events = _drain(event_queue)
+            assert all("cache" not in event.src_path for event in events)
+        finally:
+            emitter.stop()
+            emitter.join(5)
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_polling_emitter_set_exclude_dirs_rebuilds_baseline():
+    tmp = tempfile.mkdtemp()
+    try:
+        os.mkdir(os.path.join(tmp, "cache"))
+        open(os.path.join(tmp, "cache", "artifact"), "w").close()
+        os.mkdir(os.path.join(tmp, "src"))
+        open(os.path.join(tmp, "src", "module.py"), "w").close()
+
+        event_queue = Queue()
+        watch = ObservedWatch(tmp, recursive=True)
+        emitter = Emitter(event_queue, watch, timeout=0.05)
+        emitter.start()
+        try:
+            sleep(SLEEP_TIME)
+            _drain(event_queue)
+
+            # Switching the rules rebuilds the baseline: no batch of spurious
+            # deletion events for the newly hidden subtree.
+            emitter.set_exclude_dirs(["cache"])
+            sleep(SLEEP_TIME)
+            events = _drain(event_queue)
+            assert all(
+                not (isinstance(event, FileDeletedEvent) and "cache" in event.src_path)
+                for event in events
+            )
+
+            open(os.path.join(tmp, "cache", "later"), "w").close()
+            open(os.path.join(tmp, "src", "other.py"), "w").close()
+            sleep(SLEEP_TIME)
+            events = _drain(event_queue)
+            paths = {event.src_path for event in events}
+            assert os.path.join(tmp, "cache", "later") not in paths
+            assert os.path.join(tmp, "src", "other.py") in paths
+
+            # Relaxing the rules (again with an explicit rebuild) surfaces the
+            # subtree as created instead of reporting anything deleted.
+            emitter.set_exclude_dirs([])
+            open(os.path.join(tmp, "cache", "newly_exposed"), "w").close()
+            sleep(SLEEP_TIME)
+            events = _drain(event_queue)
+            assert not any(isinstance(event, FileDeletedEvent) for event in events)
+            assert os.path.join(tmp, "cache", "newly_exposed") in {
+                event.src_path for event in events if isinstance(event, FileCreatedEvent)
+            }
+        finally:
+            emitter.stop()
+            emitter.join(5)
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_polling_emitter_set_exclude_dirs_failure_keeps_previous_rules():
+    tmp = tempfile.mkdtemp()
+    try:
+        open(os.path.join(tmp, "file"), "w").close()
+
+        event_queue = Queue()
+        watch = ObservedWatch(tmp, recursive=True)
+        emitter = Emitter(event_queue, watch, timeout=0.05, exclude_dirs=["cache"])
+        emitter.start()
+        try:
+            sleep(SLEEP_TIME)
+            _drain(event_queue)
+
+            shutil.rmtree(tmp)
+
+            with pytest.raises(OSError):
+                emitter.set_exclude_dirs([])
+
+            # Rules and baseline were left untouched.
+            assert emitter._exclude_dirs == ["cache"]
+            sleep(SLEEP_TIME)
+            events = _drain(event_queue)
+            # The watched directory disappeared; the next poll reports it in
+            # the usual way rather than emitting per-file deletions.
+            assert not any(isinstance(event, FileDeletedEvent) for event in events)
+        finally:
+            emitter.stop()
+            emitter.join(5)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_polling_emitter_set_exclude_dirs_invalid_patterns_keeps_previous_rules():
+    tmp = tempfile.mkdtemp()
+    try:
+        open(os.path.join(tmp, "file"), "w").close()
+        os.mkdir(os.path.join(tmp, "dir"))
+
+        event_queue = Queue()
+        watch = ObservedWatch(tmp, recursive=True)
+        emitter = Emitter(event_queue, watch, timeout=0.05, exclude_dirs=["cache"])
+        emitter.start()
+        try:
+            sleep(SLEEP_TIME)
+            _drain(event_queue)
+
+            # "**" conflicts with the implicit include-all pattern.
+            with pytest.raises(ValueError):
+                emitter.set_exclude_dirs(["**"])
+            assert emitter._exclude_dirs == ["cache"]
+
+            # The emitter still works with the previous rules.
+            open(os.path.join(tmp, "other"), "w").close()
+            sleep(SLEEP_TIME)
+            events = _drain(event_queue)
+            assert os.path.join(tmp, "other") in {event.src_path for event in events}
+        finally:
+            emitter.stop()
+            emitter.join(5)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

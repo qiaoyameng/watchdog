@@ -65,7 +65,10 @@ def _match_path(
     else:
         included_patterns = {pattern.lower() for pattern in included_patterns}
         excluded_patterns = {pattern.lower() for pattern in excluded_patterns}
-        path = PureWindowsPath(raw_path)
+        # ``PureWindowsPath`` is case-insensitive on Python 3.13+ (thanks to
+        # ``full_match``), but the pre-3.13 backport compares the raw path
+        # text. Lowercase the path as well so both behave identically.
+        path = PureWindowsPath(raw_path.lower())
 
     common_patterns = included_patterns & excluded_patterns
     if common_patterns:
