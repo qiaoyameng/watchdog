@@ -17,12 +17,18 @@ from watchdog.events import (
     generate_sub_created_events,
     generate_sub_moved_events,
 )
-from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIMEOUT, BaseObserver, EventEmitter
+from watchdog.observers.api import (
+    DEFAULT_EMITTER_TIMEOUT,
+    DEFAULT_OBSERVER_TIMEOUT,
+    BaseObserver,
+    BatchErrorPolicy,
+    EventEmitter,
+)
 from watchdog.observers.winapi import DirectoryChangeReader
 
 if TYPE_CHECKING:
     from watchdog.events import FileSystemEvent
-    from watchdog.observers.api import EventQueue, ObservedWatch
+    from watchdog.observers.api import BatchErrorPolicy, EventQueue, ObservedWatch
 
 
 class WindowsApiEmitter(EventEmitter):
@@ -108,5 +114,18 @@ class WindowsApiObserver(BaseObserver):
     calls to event handlers.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(WindowsApiEmitter, timeout=timeout)
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        batch_size: int | None = None,
+        batch_timeout: float | None = None,
+        batch_error_policy: BatchErrorPolicy | str = BatchErrorPolicy.CONTINUE,
+    ) -> None:
+        super().__init__(
+            WindowsApiEmitter,
+            timeout=timeout,
+            batch_size=batch_size,
+            batch_timeout=batch_timeout,
+            batch_error_policy=batch_error_policy,
+        )

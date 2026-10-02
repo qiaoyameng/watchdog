@@ -1,24 +1,41 @@
 from __future__ import annotations
 
 import contextlib
+import enum
+import logging
 import queue
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 
+from watchdog.events import FileSystemEventHandler
 from watchdog.utils import BaseThread
 from watchdog.utils.bricks import SkipRepeatsQueue
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
     import types
 
     from typing_extensions import Self
 
-    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.events import EventBatch, FileSystemEvent
 
 DEFAULT_EMITTER_TIMEOUT = 1.0  # in seconds
 DEFAULT_OBSERVER_TIMEOUT = 1.0  # in seconds
+
+logger = logging.getLogger(__name__)
+
+
+class BatchErrorPolicy(enum.Enum):
+    """What an observer does when a batch handler raises an exception."""
+
+    CONTINUE = "continue"
+    STOP = "stop"
+
+
+BatchErrorPolicyArg = Union[BatchErrorPolicy, str]
 
 
 class EventQueue(SkipRepeatsQueue):
@@ -216,9 +233,11 @@ class EventDispatcher(BaseThread):
         return self._timeout
 
     def stop(self) -> None:
+        enqueue_stop_event = not self.stopped_event.is_set()
         BaseThread.stop(self)
-        with contextlib.suppress(queue.Full):
-            self.event_queue.put_nowait(EventDispatcher.stop_event)
+        if enqueue_stop_event and self.is_alive() and threading.current_thread() is not self:
+            with contextlib.suppress(queue.Full):
+                self.event_queue.put_nowait(EventDispatcher.stop_event)
 
     @property
     def event_queue(self) -> EventQueue:
@@ -247,6 +266,15 @@ class EventDispatcher(BaseThread):
             except queue.Empty:
                 continue
 
+        if self.event_queue.unfinished_tasks:
+            while True:
+                try:
+                    entry = self.event_queue.get(block=True)
+                finally:
+                    self.event_queue.task_done()
+                if entry is EventDispatcher.stop_event:
+                    break
+
 
 class BaseObserver(EventDispatcher):
     """Base observer.
@@ -259,16 +287,68 @@ class BaseObserver(EventDispatcher):
         The timeout (in seconds) for the observer to wait on events.
     :type timeout:
         ``float``
+    :param batch_size:
+        Maximum number of events in a batch. When unset, events are dispatched one by one.
+    :type batch_size:
+        ``int`` or ``None``
+    :param batch_timeout:
+        Maximum time to wait for more events once a batch starts. Defaults to ``timeout``.
+    :type batch_timeout:
+        ``float`` or ``None``
+    :param batch_error_policy:
+        Whether to log and continue, or stop after a batch handler raises.
+    :type batch_error_policy:
+        :class:`BatchErrorPolicy` or ``str``
     """
 
-    def __init__(self, emitter_class: type[EventEmitter], *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
+    def __init__(
+        self,
+        emitter_class: type[EventEmitter],
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        batch_size: int | None = None,
+        batch_timeout: float | None = None,
+        batch_error_policy: BatchErrorPolicyArg = BatchErrorPolicy.CONTINUE,
+    ) -> None:
         super().__init__(timeout=timeout)
+        if batch_size is not None:
+            if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+                msg = "batch_size must be a positive integer"
+                raise TypeError(msg)
+            if batch_size <= 0:
+                msg = "batch_size must be a positive integer"
+                raise ValueError(msg)
+        if batch_size is None and batch_timeout is not None:
+            msg = "batch_timeout requires batch_size"
+            raise ValueError(msg)
+        if batch_timeout is not None and batch_timeout < 0:
+            msg = "batch_timeout must be non-negative"
+            raise ValueError(msg)
+
         self._emitter_class = emitter_class
         self._lock = threading.RLock()
         self._watches: set[ObservedWatch] = set()
-        self._handlers: defaultdict[ObservedWatch, set[FileSystemEventHandler]] = defaultdict(set)
+        self._handlers: defaultdict[ObservedWatch, dict[FileSystemEventHandler, None]] = defaultdict(dict)
         self._emitters: set[EventEmitter] = set()
         self._emitter_for_watch: dict[ObservedWatch, EventEmitter] = {}
+        self._batch_size = batch_size
+        self._batch_timeout = self.timeout if batch_timeout is None and batch_size is not None else batch_timeout
+        self._batch_error_policy = BatchErrorPolicy(batch_error_policy)
+
+    @property
+    def batch_size(self) -> int | None:
+        """Maximum number of events dispatched together, or ``None`` for one event at a time."""
+        return self._batch_size
+
+    @property
+    def batch_timeout(self) -> float | None:
+        """Maximum time to wait to fill a batch, or ``None`` for one event at a time."""
+        return self._batch_timeout
+
+    @property
+    def batch_error_policy(self) -> BatchErrorPolicy:
+        """Policy used when a handler raises while processing a batch."""
+        return self._batch_error_policy
 
     def _add_emitter(self, emitter: EventEmitter) -> None:
         self._emitter_for_watch[emitter.watch] = emitter
@@ -277,21 +357,25 @@ class BaseObserver(EventDispatcher):
     def _remove_emitter(self, emitter: EventEmitter) -> None:
         del self._emitter_for_watch[emitter.watch]
         self._emitters.remove(emitter)
+
+    def _stop_removed_emitter(self, emitter: EventEmitter) -> None:
         emitter.stop()
         with contextlib.suppress(RuntimeError):
             emitter.join()
 
     def _clear_emitters(self) -> None:
-        for emitter in self._emitters:
-            emitter.stop()
-        for emitter in self._emitters:
-            with contextlib.suppress(RuntimeError):
-                emitter.join()
         self._emitters.clear()
         self._emitter_for_watch.clear()
 
+    def _stop_emitters(self, emitters: set[EventEmitter]) -> None:
+        for emitter in emitters:
+            emitter.stop()
+        for emitter in emitters:
+            with contextlib.suppress(RuntimeError):
+                emitter.join()
+
     def _add_handler_for_watch(self, event_handler: FileSystemEventHandler, watch: ObservedWatch) -> None:
-        self._handlers[watch].add(event_handler)
+        self._handlers[watch][event_handler] = None
 
     def _remove_handlers_for_watch(self, watch: ObservedWatch) -> None:
         del self._handlers[watch]
@@ -307,6 +391,7 @@ class BaseObserver(EventDispatcher):
                 emitter.start()
             except Exception:
                 self._remove_emitter(emitter)
+                self._stop_removed_emitter(emitter)
                 raise
         super().start()
 
@@ -413,7 +498,7 @@ class BaseObserver(EventDispatcher):
             :class:`ObservedWatch`
         """
         with self._lock:
-            self._handlers[watch].remove(event_handler)
+            del self._handlers[watch][event_handler]
 
     def unschedule(self, watch: ObservedWatch) -> None:
         """Unschedules a watch.
@@ -429,33 +514,106 @@ class BaseObserver(EventDispatcher):
             del self._handlers[watch]
             self._remove_emitter(emitter)
             self._watches.remove(watch)
+        self._stop_removed_emitter(emitter)
 
     def unschedule_all(self) -> None:
         """Unschedules all watches and detaches all associated event handlers."""
         with self._lock:
+            emitters = self._emitters.copy()
             self._handlers.clear()
             self._clear_emitters()
             self._watches.clear()
+        self._stop_emitters(emitters)
 
     def on_thread_stop(self) -> None:
         self.unschedule_all()
 
     def dispatch_events(self, event_queue: EventQueue) -> None:
-        entry = event_queue.get(block=True)
-        if entry is EventDispatcher.stop_event:
-            event_queue.task_done()
-            return
+        should_stop = False
+        if self._batch_size is None:
+            entry = event_queue.get(block=True)
+            if entry is EventDispatcher.stop_event:
+                event_queue.task_done()
+                return
 
-        event, watch = entry
-
-        with self._lock:
-            # To allow unschedule/stop and safe removal of event handlers
-            # within event handlers itself, check if the handler is still
-            # registered after every dispatch.
-            # Use .get() rather than indexing: _handlers is a defaultdict, so
-            # indexing it here would resurrect a watch that unschedule() removed
-            # but whose events were already queued.
-            for handler in list(self._handlers.get(watch, ())):
-                if handler in self._handlers.get(watch, ()):
+            event, watch = entry
+            with self._lock:
+                handlers = tuple(self._handlers.get(watch, ()))
+            for handler in handlers:
+                with self._lock:
+                    handler_is_registered = handler in self._handlers.get(watch, ())
+                if handler_is_registered:
                     handler.dispatch(event)
-        event_queue.task_done()
+            event_queue.task_done()
+        else:
+            entries, saw_stop_event = self._get_event_batch(event_queue)
+            if not entries and not saw_stop_event:
+                return
+
+            watches = tuple(dict.fromkeys(watch for _, watch in entries))
+            handlers_by_watch = self._snapshot_handlers(watches)
+            should_stop = self._dispatch_batch(entries, handlers_by_watch)
+            for _ in range(len(entries) + int(saw_stop_event)):
+                event_queue.task_done()
+
+        if should_stop:
+            self.stop()
+
+    def _get_event_batch(
+        self,
+        event_queue: EventQueue,
+    ) -> tuple[tuple[tuple[FileSystemEvent, ObservedWatch], ...], bool]:
+        entries: list[tuple[FileSystemEvent, ObservedWatch]] = []
+        deadline: float | None = None
+
+        assert self._batch_size is not None
+        while len(entries) < self._batch_size:
+            try:
+                if not entries:
+                    entry = event_queue.get(block=True)
+                elif self._batch_timeout is None:
+                    entry = event_queue.get_nowait()
+                else:
+                    if deadline is None:
+                        deadline = time.monotonic() + self._batch_timeout
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0:
+                        break
+                    entry = event_queue.get(block=True, timeout=timeout)
+            except queue.Empty:
+                break
+
+            if entry is EventDispatcher.stop_event:
+                return tuple(entries), True
+            entries.append(entry)
+
+        return tuple(entries), False
+
+    def _snapshot_handlers(
+        self,
+        watches: Sequence[ObservedWatch],
+    ) -> Mapping[ObservedWatch, tuple[FileSystemEventHandler, ...]]:
+        with self._lock:
+            return {watch: tuple(self._handlers.get(watch, ())) for watch in watches}
+
+    def _dispatch_batch(
+        self,
+        entries: Sequence[tuple[FileSystemEvent, ObservedWatch]],
+        handlers_by_watch: Mapping[ObservedWatch, tuple[FileSystemEventHandler, ...]],
+    ) -> bool:
+        should_stop = False
+        events_by_watch: dict[ObservedWatch, list[FileSystemEvent]] = {}
+        for event, watch in entries:
+            events_by_watch.setdefault(watch, []).append(event)
+
+        for watch, events in events_by_watch.items():
+            batch: EventBatch = tuple(events)
+            for handler in handlers_by_watch.get(watch, ()):
+                try:
+                    handler.dispatch_batch(batch)
+                except Exception:
+                    logger.exception("Unhandled exception while dispatching an event batch")
+                    if self._batch_error_policy is BatchErrorPolicy.STOP:
+                        should_stop = True
+
+        return should_stop

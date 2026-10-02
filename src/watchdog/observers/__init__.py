@@ -40,6 +40,7 @@ import contextlib
 import warnings
 from typing import TYPE_CHECKING, Protocol
 
+from watchdog.observers.api import BatchErrorPolicy
 from watchdog.utils import UnsupportedLibcError, platform
 
 if TYPE_CHECKING:
@@ -47,7 +48,14 @@ if TYPE_CHECKING:
 
 
 class ObserverType(Protocol):
-    def __call__(self, *, timeout: float = ...) -> BaseObserver: ...
+    def __call__(
+        self,
+        *,
+        timeout: float = ...,
+        batch_size: int | None = ...,
+        batch_timeout: float | None = ...,
+        batch_error_policy: BatchErrorPolicy | str = ...,
+    ) -> BaseObserver: ...
 
 
 def _get_observer_cls() -> ObserverType:
@@ -88,4 +96,4 @@ def _get_observer_cls() -> ObserverType:
 
 Observer = _get_observer_cls()
 
-__all__ = ["Observer"]
+__all__ = ["BatchErrorPolicy", "Observer"]

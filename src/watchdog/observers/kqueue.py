@@ -80,7 +80,13 @@ from watchdog.events import (
     FileMovedEvent,
     generate_sub_moved_events,
 )
-from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIMEOUT, BaseObserver, EventEmitter
+from watchdog.observers.api import (
+    DEFAULT_EMITTER_TIMEOUT,
+    DEFAULT_OBSERVER_TIMEOUT,
+    BaseObserver,
+    BatchErrorPolicy,
+    EventEmitter,
+)
 from watchdog.utils import platform
 from watchdog.utils.dirsnapshot import DirectorySnapshot
 
@@ -89,7 +95,7 @@ if TYPE_CHECKING:
     from typing import Callable
 
     from watchdog.events import FileSystemEvent
-    from watchdog.observers.api import EventQueue, ObservedWatch
+    from watchdog.observers.api import BatchErrorPolicy, EventQueue, ObservedWatch
 
 # Maximum number of events to process.
 MAX_EVENTS = 4096
@@ -657,5 +663,18 @@ class KqueueObserver(BaseObserver):
     calls to event handlers.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(KqueueEmitter, timeout=timeout)
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        batch_size: int | None = None,
+        batch_timeout: float | None = None,
+        batch_error_policy: BatchErrorPolicy | str = BatchErrorPolicy.CONTINUE,
+    ) -> None:
+        super().__init__(
+            KqueueEmitter,
+            timeout=timeout,
+            batch_size=batch_size,
+            batch_timeout=batch_timeout,
+            batch_error_policy=batch_error_policy,
+        )

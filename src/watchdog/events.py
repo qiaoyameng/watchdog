@@ -90,7 +90,7 @@ from typing import TYPE_CHECKING
 from watchdog.utils.patterns import match_any_paths
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Iterable, Generator
 
 EVENT_TYPE_MOVED = "moved"
 EVENT_TYPE_DELETED = "deleted"
@@ -122,6 +122,9 @@ class FileSystemEvent:
     These are events that weren't actually broadcast by the OS, but
     are presumed to have happened based on other, actual events.
     """
+
+
+EventBatch = tuple[FileSystemEvent, ...]
 
 
 class FileSystemMovedEvent(FileSystemEvent):
@@ -214,6 +217,15 @@ class DirMovedEvent(FileSystemMovedEvent):
 
 class FileSystemEventHandler:
     """Base file system event handler that you can override methods from."""
+
+    def dispatch_batch(self, events: Iterable[FileSystemEvent]) -> None:
+        """Dispatches a read-only batch of events in queue order.
+
+        Override this method to handle multiple events together. The iterable is
+        a tuple when called by an observer configured for batch dispatching.
+        """
+        for event in events:
+            self.dispatch(event)
 
     def dispatch(self, event: FileSystemEvent) -> None:
         """Dispatches events to the appropriate methods.

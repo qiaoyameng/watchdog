@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import logging
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from watchdog.events import FileModifiedEvent, FileOpenedEvent, LoggingEventHandler
-from watchdog.observers.api import BaseObserver, EventDispatcher, EventEmitter, EventQueue, ObservedWatch
+from watchdog.events import FileModifiedEvent, FileOpenedEvent, FileSystemEventHandler, LoggingEventHandler
+from watchdog.observers.api import (
+    BaseObserver,
+    BatchErrorPolicy,
+    EventDispatcher,
+    EventEmitter,
+    EventQueue,
+    ObservedWatch,
+)
 
 
 def test_observer_constructor():
@@ -163,10 +172,10 @@ def test_observer_marks_every_queued_item_done():
 def test_stale_event_does_not_resurrect_an_unscheduled_watch():
     """A watch removed by unschedule() must stay removed when a queued event lands.
 
-    ``BaseObserver._handlers`` is a ``defaultdict(set)``, so indexing it in
+    ``BaseObserver._handlers`` is a ``defaultdict``, so indexing it in
     ``dispatch_events()`` recreates whatever key it is given. An event queued
     before ``unschedule()`` is still dispatched afterwards, which put the removed
-    watch back as an empty set that nothing ever cleans up.
+    watch back as an empty mapping that nothing ever cleans up.
     """
     observer = BaseObserver(EventEmitter)
     handler = LoggingEventHandler()
@@ -179,3 +188,243 @@ def test_stale_event_does_not_resurrect_an_unscheduled_watch():
     observer.dispatch_events(observer.event_queue)
 
     assert watch not in observer._handlers  # noqa: SLF001
+
+
+class BatchRecordingHandler:
+    def __init__(self, name, batches):
+        self.name = name
+        self.batches = batches
+
+    def dispatch_batch(self, batch):
+        self.batches.append((self.name, tuple(event.src_path for event in batch)))
+        assert isinstance(batch, tuple)
+
+
+def test_batch_dispatch_uses_snapshot_until_next_batch():
+    observer = BaseObserver(EventEmitter, batch_size=2, batch_timeout=None)
+    watch = ObservedWatch("/foobar", recursive=True)
+    batches = []
+
+    class ReplacingHandler(BatchRecordingHandler):
+        def dispatch_batch(self, batch):
+            super().dispatch_batch(batch)
+            observer.remove_handler_for_watch(old_second, watch)
+            observer.add_handler_for_watch(new_second, watch)
+
+    first = ReplacingHandler("first", batches)
+    old_second = BatchRecordingHandler("old", batches)
+    new_second = BatchRecordingHandler("new", batches)
+
+    observer.add_handler_for_watch(first, watch)
+    observer.add_handler_for_watch(old_second, watch)
+    observer.event_queue.put((FileModifiedEvent("/one"), watch))
+    observer.event_queue.put((FileModifiedEvent("/two"), watch))
+    observer.event_queue.put((FileModifiedEvent("/three"), watch))
+    observer.event_queue.put((FileModifiedEvent("/four"), watch))
+
+    observer.dispatch_events(observer.event_queue)
+    assert batches == [
+        ("first", ("/one", "/two")),
+        ("old", ("/one", "/two")),
+    ]
+
+    observer.dispatch_events(observer.event_queue)
+    assert batches == [
+        ("first", ("/one", "/two")),
+        ("old", ("/one", "/two")),
+        ("first", ("/three", "/four")),
+        ("new", ("/three", "/four")),
+    ]
+    assert observer.event_queue.unfinished_tasks == 0
+
+
+def test_batch_dispatch_preserves_order_and_read_only_batch():
+    observer = BaseObserver(EventEmitter, batch_size=3, batch_timeout=None)
+    watch = ObservedWatch("/foobar", recursive=True)
+
+    class OrderHandler:
+        def __init__(self):
+            self.batches = []
+
+        def dispatch_batch(self, batch):
+            with pytest.raises(TypeError):
+                batch[0] = FileModifiedEvent("/changed")
+            self.batches.append(tuple(event.src_path for event in batch))
+
+    handler = OrderHandler()
+    observer.add_handler_for_watch(handler, watch)
+    for index in range(3):
+        observer.event_queue.put((FileModifiedEvent(f"/{index}"), watch))
+
+    observer.dispatch_events(observer.event_queue)
+
+    assert handler.batches == [("/0", "/1", "/2")]
+    assert observer.event_queue.unfinished_tasks == 0
+
+
+def test_batch_dispatch_continue_policy_logs_and_continues(caplog):
+    observer = BaseObserver(EventEmitter, batch_size=2, batch_timeout=None)
+    watch = ObservedWatch("/foobar", recursive=True)
+    good_batches = []
+
+    class FailingHandler:
+        def dispatch_batch(self, batch):
+            raise RuntimeError("boom")
+
+    good = BatchRecordingHandler("good", good_batches)
+    observer.add_handler_for_watch(FailingHandler(), watch)
+    observer.add_handler_for_watch(good, watch)
+    observer.event_queue.put((FileModifiedEvent("/one"), watch))
+    observer.event_queue.put((FileModifiedEvent("/two"), watch))
+
+    with caplog.at_level(logging.ERROR):
+        observer.dispatch_events(observer.event_queue)
+
+    assert good_batches == [("good", ("/one", "/two"))]
+    assert "Unhandled exception while dispatching an event batch" in caplog.text
+    assert observer.event_queue.unfinished_tasks == 0
+
+
+def test_batch_dispatch_stop_policy_finishes_batch_and_join_returns():
+    observer = BaseObserver(
+        EventEmitter,
+        batch_size=2,
+        batch_timeout=None,
+        batch_error_policy=BatchErrorPolicy.STOP,
+    )
+    watch = ObservedWatch("/foobar", recursive=True)
+    good_batches = []
+
+    class FailingHandler:
+        def dispatch_batch(self, batch):
+            raise RuntimeError("boom")
+
+    good = BatchRecordingHandler("good", good_batches)
+    observer.add_handler_for_watch(FailingHandler(), watch)
+    observer.add_handler_for_watch(good, watch)
+    observer.event_queue.put((FileModifiedEvent("/one"), watch))
+    observer.event_queue.put((FileModifiedEvent("/two"), watch))
+
+    observer.start()
+    observer.event_queue.join()
+    observer.join(timeout=2)
+
+    assert not observer.is_alive()
+    assert good_batches == [("good", ("/one", "/two"))]
+    assert observer.event_queue.unfinished_tasks == 0
+
+
+def test_batch_configuration_validation():
+    with pytest.raises(TypeError, match="positive integer"):
+        BaseObserver(EventEmitter, batch_size=True)
+    with pytest.raises(ValueError, match="positive integer"):
+        BaseObserver(EventEmitter, batch_size=0)
+    with pytest.raises(ValueError, match="non-negative"):
+        BaseObserver(EventEmitter, batch_size=1, batch_timeout=-0.1)
+
+
+def test_batch_dispatch_finishes_current_batch_when_watch_is_unscheduled():
+    observer = BaseObserver(EventEmitter, batch_size=2, batch_timeout=None)
+    watch = observer.schedule(FileSystemEventHandler(), "/foobar", recursive=True)
+    batches = []
+    remaining = BatchRecordingHandler("remaining", batches)
+
+    class UnschedulingHandler:
+        def dispatch_batch(self, batch):
+            observer.unschedule(watch)
+            batches.append(("unscheduling", tuple(event.src_path for event in batch)))
+
+    observer.add_handler_for_watch(UnschedulingHandler(), watch)
+    observer.add_handler_for_watch(remaining, watch)
+    observer.event_queue.put((FileModifiedEvent("/one"), watch))
+    observer.event_queue.put((FileModifiedEvent("/two"), watch))
+
+    observer.dispatch_events(observer.event_queue)
+
+    assert batches == [
+        ("unscheduling", ("/one", "/two")),
+        ("remaining", ("/one", "/two")),
+    ]
+    assert not observer.emitters
+    assert observer.event_queue.unfinished_tasks == 0
+
+
+def test_batch_dispatch_waits_for_current_batch_on_stop():
+    observer = BaseObserver(EventEmitter, batch_size=2, batch_timeout=None)
+    watch = ObservedWatch("/foobar", recursive=True)
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    batches = []
+
+    class SlowHandler:
+        def dispatch_batch(self, batch):
+            callback_started.set()
+            assert release_callback.wait(2)
+            batches.append(tuple(event.src_path for event in batch))
+
+    observer.add_handler_for_watch(SlowHandler(), watch)
+    observer.event_queue.put((FileModifiedEvent("/one"), watch))
+    observer.event_queue.put((FileModifiedEvent("/two"), watch))
+
+    observer.start()
+    assert callback_started.wait(2)
+    observer.stop()
+    release_callback.set()
+    observer.join(timeout=2)
+
+    assert not observer.is_alive()
+    assert batches == [("/one", "/two")]
+    assert observer.event_queue.unfinished_tasks == 0
+
+
+def test_batch_timeout_requires_batch_size():
+    with pytest.raises(ValueError, match="batch_timeout requires batch_size"):
+        BaseObserver(EventEmitter, batch_timeout=0.1)
+
+
+def test_unschedule_does_not_hold_subscription_lock_while_emitter_stops():
+    class BlockingEmitter(EventEmitter):
+        stop_started = threading.Event()
+        release_stop = threading.Event()
+
+        def stop(self):
+            type(self).stop_started.set()
+            assert type(self).release_stop.wait(2)
+            super().stop()
+
+    observer = BaseObserver(BlockingEmitter)
+    watch = observer.schedule(FileSystemEventHandler(), "/foobar", recursive=True)
+    unscheduled = threading.Event()
+
+    def unschedule():
+        observer.unschedule(watch)
+        unscheduled.set()
+
+    thread = threading.Thread(target=unschedule)
+    observer.start()
+    thread.start()
+    assert BlockingEmitter.stop_started.wait(2)
+    assert observer._lock.acquire(timeout=0.1)  # noqa: SLF001
+    observer._lock.release()  # noqa: SLF001
+    BlockingEmitter.release_stop.set()
+    assert unscheduled.wait(2)
+    thread.join()
+    observer.stop()
+    observer.join(timeout=2)
+
+    assert not observer.is_alive()
+
+
+def test_batch_dispatch_flushes_after_timeout():
+    observer = BaseObserver(EventEmitter, batch_size=3, batch_timeout=0.01)
+    watch = ObservedWatch("/foobar", recursive=True)
+    batches = []
+    handler = BatchRecordingHandler("handler", batches)
+
+    observer.add_handler_for_watch(handler, watch)
+    observer.event_queue.put((FileModifiedEvent("/one"), watch))
+
+    observer.dispatch_events(observer.event_queue)
+
+    assert batches == [("handler", ("/one",))]
+    assert observer.event_queue.unfinished_tasks == 0
