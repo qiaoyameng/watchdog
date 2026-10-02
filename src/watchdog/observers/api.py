@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from watchdog.events import OverflowEvent
 from watchdog.utils import BaseThread
 from watchdog.utils.bricks import SkipRepeatsQueue
 
@@ -28,11 +29,77 @@ class EventQueue(SkipRepeatsQueue):
     calls when multiple identical events are produced quicker than an observer
     can consume them.
 
+    When ``maxsize`` is a positive number the queue is bounded and producers
+    never block: events that do not fit are dropped and merged into a pending
+    overflow gap for their watch (see :meth:`put_event`). Pending gaps live
+    outside the bounded queue, so the overflow notification itself can never
+    be lost to a full queue; they are promoted into the queue by
+    :meth:`promote_pending_overflows` as soon as the consumer frees slots.
+
     :param maxsize:
         Maximum number of items allowed in the queue. If <= 0, the queue size is infinite.
     :type maxsize:
         ``int``
     """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize)
+        self._overflow_lock = threading.Lock()
+        self._pending_overflows: dict[ObservedWatch, int] = {}
+
+    def put_event(self, event: FileSystemEvent, watch: ObservedWatch) -> None:
+        """Queues ``(event, watch)`` without ever blocking the producer.
+
+        If the queue is bounded and full, the event is dropped and the loss
+        is merged into the pending overflow gap recorded for ``watch``.
+
+        :param event:
+            Event to be queued.
+        :param watch:
+            The watch the event belongs to.
+        """
+        try:
+            self.put_nowait((event, watch))
+        except queue.Full:
+            with self._overflow_lock:
+                self._pending_overflows[watch] = self._pending_overflows.get(watch, 0) + 1
+
+    @property
+    def has_pending_overflows(self) -> bool:
+        """``True`` if overflow notifications are waiting for queue space."""
+        with self._overflow_lock:
+            return bool(self._pending_overflows)
+
+    def promote_pending_overflows(self) -> None:
+        """Moves pending overflow notifications into the queue while there is room.
+
+        Each pending gap becomes one :class:`watchdog.events.OverflowEvent`
+        queued for its watch, preserving the order in which the gaps were
+        first recorded. Gaps that still do not fit remain pending for the
+        next call.
+        """
+        with self._overflow_lock:
+            while self._pending_overflows:
+                watch, dropped_count = next(iter(self._pending_overflows.items()))
+                try:
+                    self.put_nowait((OverflowEvent(watch.path, dropped_count=dropped_count), watch))
+                except queue.Full:
+                    break
+                del self._pending_overflows[watch]
+
+    def discard_pending_overflow(self, watch: ObservedWatch) -> None:
+        """Drops any pending overflow notification for ``watch``.
+
+        Called when a watch is unscheduled so no notification is left
+        waiting for a queue position that nobody will consume.
+        """
+        with self._overflow_lock:
+            self._pending_overflows.pop(watch, None)
+
+    def clear_pending_overflows(self) -> None:
+        """Drops all pending overflow notifications (e.g. on observer stop)."""
+        with self._overflow_lock:
+            self._pending_overflows.clear()
 
 
 class ObservedWatch:
@@ -166,6 +233,11 @@ class EventEmitter(BaseThread):
     def queue_event(self, event: FileSystemEvent) -> None:
         """Queues a single event.
 
+        With an :class:`EventQueue` this never blocks the emitter: on a
+        bounded, full queue the event is dropped and an overflow gap is
+        recorded for this emitter's watch instead (see
+        :meth:`EventQueue.put_event`).
+
         :param event:
             Event to be queued.
         :type event:
@@ -173,7 +245,10 @@ class EventEmitter(BaseThread):
             or a subclass.
         """
         if self._event_filter is None or any(isinstance(event, cls) for cls in self._event_filter):
-            self._event_queue.put((event, self.watch))
+            if isinstance(self._event_queue, EventQueue):
+                self._event_queue.put_event(event, self.watch)
+            else:
+                self._event_queue.put((event, self.watch))
 
     def queue_events(self, timeout: float) -> None:
         """Override this method to populate the event queue with events
@@ -200,14 +275,20 @@ class EventDispatcher(BaseThread):
         constructions in the child class BaseObserver.
     :type timeout:
         ``float``
+    :param maxsize:
+        Maximum number of events allowed in the event queue. If <= 0
+        (the default), the queue size is infinite and producers never
+        drop events.
+    :type maxsize:
+        ``int``
     """
 
     stop_event = object()
     """Event inserted into the queue to signal a requested stop."""
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
+    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, maxsize: int = 0) -> None:
         super().__init__()
-        self._event_queue = EventQueue()
+        self._event_queue = EventQueue(maxsize)
         self._timeout = timeout
 
     @property
@@ -217,8 +298,19 @@ class EventDispatcher(BaseThread):
 
     def stop(self) -> None:
         BaseThread.stop(self)
-        with contextlib.suppress(queue.Full):
-            self.event_queue.put_nowait(EventDispatcher.stop_event)
+        if threading.current_thread() is self:
+            # Called from the dispatcher thread itself: the run loop exits on
+            # its own, so the sentinel is only a best-effort wakeup.
+            with contextlib.suppress(queue.Full):
+                self.event_queue.put_nowait(EventDispatcher.stop_event)
+            return
+        # A bounded queue may be full when stop() is called; keep retrying
+        # until the sentinel is queued so the dispatcher never waits forever
+        # on a stop signal that was silently dropped.
+        while self.is_alive():
+            with contextlib.suppress(queue.Full):
+                self.event_queue.put(EventDispatcher.stop_event, timeout=0.1)
+                break
 
     @property
     def event_queue(self) -> EventQueue:
@@ -259,10 +351,25 @@ class BaseObserver(EventDispatcher):
         The timeout (in seconds) for the observer to wait on events.
     :type timeout:
         ``float``
+    :param maxsize:
+        Maximum number of events allowed in the event queue. If <= 0
+        (the default), the queue size is infinite. On a bounded, full
+        queue, emitters drop new events and record an overflow gap for
+        the affected watch instead of blocking; the gap surfaces as an
+        :class:`watchdog.events.OverflowEvent` once the consumer catches
+        up, signalling that the watch should be rescanned.
+    :type maxsize:
+        ``int``
     """
 
-    def __init__(self, emitter_class: type[EventEmitter], *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(timeout=timeout)
+    def __init__(
+        self,
+        emitter_class: type[EventEmitter],
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        maxsize: int = 0,
+    ) -> None:
+        super().__init__(timeout=timeout, maxsize=maxsize)
         self._emitter_class = emitter_class
         self._lock = threading.RLock()
         self._watches: set[ObservedWatch] = set()
@@ -429,6 +536,7 @@ class BaseObserver(EventDispatcher):
             del self._handlers[watch]
             self._remove_emitter(emitter)
             self._watches.remove(watch)
+            self.event_queue.discard_pending_overflow(watch)
 
     def unschedule_all(self) -> None:
         """Unschedules all watches and detaches all associated event handlers."""
@@ -436,11 +544,16 @@ class BaseObserver(EventDispatcher):
             self._handlers.clear()
             self._clear_emitters()
             self._watches.clear()
+            self.event_queue.clear_pending_overflows()
 
     def on_thread_stop(self) -> None:
         self.unschedule_all()
 
     def dispatch_events(self, event_queue: EventQueue) -> None:
+        # Surface overflow notifications held back while a bounded queue was
+        # full; they live outside the queue so they are never dropped, and
+        # must become visible once the consumer frees slots.
+        event_queue.promote_pending_overflows()
         entry = event_queue.get(block=True)
         if entry is EventDispatcher.stop_event:
             event_queue.task_done()

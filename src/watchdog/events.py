@@ -58,6 +58,10 @@ Event Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: OverflowEvent
+   :members:
+   :show-inheritance:
+
 
 Event Handler Classes
 ---------------------
@@ -99,6 +103,7 @@ EVENT_TYPE_MODIFIED = "modified"
 EVENT_TYPE_CLOSED = "closed"
 EVENT_TYPE_CLOSED_NO_WRITE = "closed_no_write"
 EVENT_TYPE_OPENED = "opened"
+EVENT_TYPE_OVERFLOW = "overflow"
 
 
 @dataclass(unsafe_hash=True)
@@ -212,6 +217,30 @@ class DirMovedEvent(FileSystemMovedEvent):
     is_directory = True
 
 
+# Synthetic events.
+
+
+class OverflowEvent(FileSystemEvent):
+    """Synthetic event signalling that one or more file system events were lost
+    because the observer's bounded event queue was full while the consumer
+    could not keep up.
+
+    Consecutive losses for the same watch are merged into a single gap:
+    ``dropped_count`` records how many events were dropped while no
+    notification for that watch was waiting to be delivered.
+
+    Receiving this event means the affected watch (available as
+    ``src_path``) should be rescanned. The dropped events are *not*
+    recoverable; this notification only marks where the gap is.
+    """
+
+    event_type = EVENT_TYPE_OVERFLOW
+
+    def __init__(self, src_path: bytes | str, *, dropped_count: int = 1) -> None:
+        super().__init__(src_path, is_synthetic=True)
+        self.dropped_count = dropped_count
+
+
 class FileSystemEventHandler:
     """Base file system event handler that you can override methods from."""
 
@@ -302,6 +331,19 @@ class FileSystemEventHandler:
             Event representing file opening.
         :type event:
             :class:`watchdog.events.FileOpenedEvent`
+        """
+
+    def on_overflow(self, event: OverflowEvent) -> None:
+        """Called when the observer's bounded event queue overflowed and
+        events were lost.
+
+        The affected watch should be rescanned; the dropped events are not
+        recoverable.
+
+        :param event:
+            Event representing the gap of lost events.
+        :type event:
+            :class:`watchdog.events.OverflowEvent`
         """
 
 

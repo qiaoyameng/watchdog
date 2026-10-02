@@ -657,5 +657,5 @@ class KqueueObserver(BaseObserver):
     calls to event handlers.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(KqueueEmitter, timeout=timeout)
+    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, maxsize: int = 0) -> None:
+        super().__init__(KqueueEmitter, timeout=timeout, maxsize=maxsize)

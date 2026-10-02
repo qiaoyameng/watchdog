@@ -123,8 +123,8 @@ class PollingObserver(BaseObserver):
     system changes.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(PollingEmitter, timeout=timeout)
+    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, maxsize: int = 0) -> None:
+        super().__init__(PollingEmitter, timeout=timeout, maxsize=maxsize)
 
 
 class PollingObserverVFS(BaseObserver):
@@ -136,11 +136,13 @@ class PollingObserverVFS(BaseObserver):
         listdir: Callable[[str | None], Iterator[os.DirEntry]],
         *,
         polling_interval: int = 1,
+        maxsize: int = 0,
     ) -> None:
         """:param stat: stat function. See ``os.stat`` for details.
         :param listdir: listdir function. See ``os.scandir`` for details.
         :type polling_interval: int
         :param polling_interval: interval in seconds between polling the file system.
+        :param maxsize: maximum number of events allowed in the event queue (<= 0 means unbounded).
         """
         emitter_cls = partial(PollingEmitter, stat=stat, listdir=listdir)
-        super().__init__(emitter_cls, timeout=polling_interval)  # type: ignore[arg-type]
+        super().__init__(emitter_cls, timeout=polling_interval, maxsize=maxsize)  # type: ignore[arg-type]

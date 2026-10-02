@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
 
 class ObserverType(Protocol):
-    def __call__(self, *, timeout: float = ...) -> BaseObserver: ...
+    def __call__(self, *, timeout: float = ..., maxsize: int = ...) -> BaseObserver: ...
 
 
 def _get_observer_cls() -> ObserverType:
