@@ -551,6 +551,12 @@ class InotifyObserver(BaseObserver):
     calls to event handlers.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, generate_full_events: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        generate_full_events: bool = False,
+        event_queue_maxsize: int = 0,
+    ) -> None:
         cls = InotifyFullEmitter if generate_full_events else InotifyEmitter
-        super().__init__(cls, timeout=timeout)
+        super().__init__(cls, timeout=timeout, event_queue_maxsize=event_queue_maxsize)

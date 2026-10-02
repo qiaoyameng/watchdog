@@ -58,6 +58,10 @@ Event Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: EventQueueOverflowedEvent
+   :members:
+   :show-inheritance:
+
 
 Event Handler Classes
 ---------------------
@@ -99,6 +103,7 @@ EVENT_TYPE_MODIFIED = "modified"
 EVENT_TYPE_CLOSED = "closed"
 EVENT_TYPE_CLOSED_NO_WRITE = "closed_no_write"
 EVENT_TYPE_OPENED = "opened"
+EVENT_TYPE_EVENT_QUEUE_OVERFLOWED = "event_queue_overflowed"
 
 
 @dataclass(unsafe_hash=True)
@@ -212,6 +217,19 @@ class DirMovedEvent(FileSystemMovedEvent):
     is_directory = True
 
 
+class EventQueueOverflowedEvent(FileSystemEvent):
+    """Event indicating that one or more queued events for a watch were dropped.
+
+    Handlers should treat this as a signal to rescan the affected watch. The
+    event does not contain or replay the events that were lost.
+    """
+
+    event_type = EVENT_TYPE_EVENT_QUEUE_OVERFLOWED
+
+
+EventQueueOverflowEvent = EventQueueOverflowedEvent
+
+
 class FileSystemEventHandler:
     """Base file system event handler that you can override methods from."""
 
@@ -302,6 +320,13 @@ class FileSystemEventHandler:
             Event representing file opening.
         :type event:
             :class:`watchdog.events.FileOpenedEvent`
+        """
+
+    def on_event_queue_overflowed(self, event: EventQueueOverflowedEvent) -> None:
+        """Called when a bounded event queue had to drop events for a watch.
+
+        Rescan the affected watch when this is received. The dropped events are
+        not replayed by this notification.
         """
 
 

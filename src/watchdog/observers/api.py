@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import contextlib
 import queue
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from watchdog.events import EventQueueOverflowedEvent, FileSystemEvent
 from watchdog.utils import BaseThread
 from watchdog.utils.bricks import SkipRepeatsQueue
 
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
-    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.events import FileSystemEventHandler
 
 DEFAULT_EMITTER_TIMEOUT = 1.0  # in seconds
 DEFAULT_OBSERVER_TIMEOUT = 1.0  # in seconds
@@ -29,10 +30,149 @@ class EventQueue(SkipRepeatsQueue):
     can consume them.
 
     :param maxsize:
-        Maximum number of items allowed in the queue. If <= 0, the queue size is infinite.
+        Maximum number of items allowed in the queue. If ``<= 0`` (the
+        default), the queue size is infinite.
     :type maxsize:
         ``int``
     """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize)
+        self._active_overflowed_watches: set[ObservedWatch] = set()
+        self._queued_overflowed_watches: set[ObservedWatch] = set()
+        self._shutdown = False
+
+    @staticmethod
+    def _entry_watch(entry: object) -> ObservedWatch | None:
+        if isinstance(entry, tuple) and len(entry) == 2:
+            watch = entry[1]
+            if isinstance(watch, ObservedWatch):
+                return watch
+        return None
+
+    def _is_overflow_entry(self, entry: object) -> bool:
+        return isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[0], EventQueueOverflowedEvent)
+
+    def put_nowait(self, item: object) -> None:
+        with self.mutex:
+            if self._last_item is not None and item == self._last_item:
+                return
+            if self.maxsize > 0 and self._qsize() >= self.maxsize:
+                raise queue.Full
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+            self.all_tasks_done.notify_all()
+
+    def mark_overflow(self, watch: ObservedWatch) -> None:
+        """Record that events were dropped and ensure a gap notification is delivered."""
+        with self.mutex:
+            if watch in self._active_overflowed_watches:
+                return
+            self._active_overflowed_watches.add(watch)
+            if not self._shutdown and (self.maxsize <= 0 or self._qsize() < self.maxsize):
+                self._put_overflow(watch)
+
+    def _put_overflow(self, watch: ObservedWatch) -> None:
+        self._put((EventQueueOverflowedEvent(watch.path, is_synthetic=True), watch))
+        self.unfinished_tasks += 1
+        self._queued_overflowed_watches.add(watch)
+        self.not_empty.notify()
+        self.all_tasks_done.notify_all()
+
+    def _put_pending_overflows(self) -> None:
+        if self._shutdown:
+            return
+        while self.maxsize <= 0 or self._qsize() < self.maxsize:
+            pending_watch = next(iter(self._active_overflowed_watches - self._queued_overflowed_watches), None)
+            if pending_watch is None:
+                break
+            self._put_overflow(pending_watch)
+
+    def _after_get(self, entry: object) -> None:
+        watch = self._entry_watch(entry)
+        if (
+            watch is not None
+            and isinstance(entry, tuple)
+            and isinstance(entry[0], EventQueueOverflowedEvent)
+        ):
+            self._queued_overflowed_watches.discard(watch)
+            self._active_overflowed_watches.discard(watch)
+
+        self._put_pending_overflows()
+
+    def _get(self) -> object:
+        entry = super()._get()
+        self._after_get(entry)
+        return entry
+
+    def _remove_overflow_entries(self, watches: set[ObservedWatch] | None = None) -> int:
+        watches_to_remove = self._queued_overflowed_watches if watches is None else watches
+        removed_count = 0
+        for entry in list(self.queue):
+            entry_watch = self._entry_watch(entry)
+            if entry_watch is not None and entry_watch in watches_to_remove and self._is_overflow_entry(entry):
+                self._queued_overflowed_watches.discard(entry_watch)
+                removed_count += 1
+                self.queue.remove(entry)
+
+        if not self.queue:
+            self._last_item = None
+        else:
+            self._last_item = self.queue[-1]
+        self.unfinished_tasks -= removed_count
+        if removed_count:
+            self.not_full.notify_all()
+            self.all_tasks_done.notify_all()
+        return removed_count
+
+    def discard_watch(self, watch: ObservedWatch) -> None:
+        """Remove gap state and queued gap notifications for a cancelled watch."""
+        with self.mutex:
+            self._active_overflowed_watches.discard(watch)
+            if watch in self._queued_overflowed_watches:
+                self._remove_overflow_entries({watch})
+                self._put_pending_overflows()
+
+    def discard_all_overflows(self) -> None:
+        """Remove all gap notifications during observer shutdown."""
+        with self.mutex:
+            if self._active_overflowed_watches:
+                self._active_overflowed_watches.clear()
+                self._remove_overflow_entries()
+
+    def shutdown(self) -> None:
+        """Wake consumers blocked on an empty or full bounded queue."""
+        with self.mutex:
+            self._shutdown = True
+            self.not_empty.notify_all()
+
+    def get(self, block: bool = True, timeout: float | None = None) -> object:
+        with self.not_empty:
+            if not block:
+                if not self._qsize() and not self._shutdown:
+                    raise queue.Empty
+            elif timeout is None:
+                while not self._qsize() and not self._shutdown:
+                    self.not_empty.wait()
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                end_time = time.monotonic() + timeout
+                while not self._qsize() and not self._shutdown:
+                    remaining = end_time - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Empty
+                    self.not_empty.wait(remaining)
+
+            if not self._qsize():
+                self.unfinished_tasks += 1
+                self.all_tasks_done.notify_all()
+                return EventDispatcher.stop_event
+
+            entry = self._get()
+            self.not_full.notify()
+            return entry
 
 
 class ObservedWatch:
@@ -173,7 +313,10 @@ class EventEmitter(BaseThread):
             or a subclass.
         """
         if self._event_filter is None or any(isinstance(event, cls) for cls in self._event_filter):
-            self._event_queue.put((event, self.watch))
+            try:
+                self._event_queue.put_nowait((event, self.watch))
+            except queue.Full:
+                self._event_queue.mark_overflow(self.watch)
 
     def queue_events(self, timeout: float) -> None:
         """Override this method to populate the event queue with events
@@ -200,14 +343,19 @@ class EventDispatcher(BaseThread):
         constructions in the child class BaseObserver.
     :type timeout:
         ``float``
+    :param event_queue_maxsize:
+        Maximum number of events buffered by the observer. ``<= 0`` (the
+        default) means an unbounded queue.
+    :type event_queue_maxsize:
+        ``int``
     """
 
     stop_event = object()
-    """Event inserted into the queue to signal a requested stop."""
+    """Sentinel returned by a shut down queue to signal a requested stop."""
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
+    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, event_queue_maxsize: int = 0) -> None:
         super().__init__()
-        self._event_queue = EventQueue()
+        self._event_queue = EventQueue(event_queue_maxsize)
         self._timeout = timeout
 
     @property
@@ -217,8 +365,8 @@ class EventDispatcher(BaseThread):
 
     def stop(self) -> None:
         BaseThread.stop(self)
-        with contextlib.suppress(queue.Full):
-            self.event_queue.put_nowait(EventDispatcher.stop_event)
+        self.event_queue.discard_all_overflows()
+        self.event_queue.shutdown()
 
     @property
     def event_queue(self) -> EventQueue:
@@ -259,10 +407,21 @@ class BaseObserver(EventDispatcher):
         The timeout (in seconds) for the observer to wait on events.
     :type timeout:
         ``float``
+    :param event_queue_maxsize:
+        Maximum number of events buffered by the observer. ``<= 0`` (the
+        default) means an unbounded queue.
+    :type event_queue_maxsize:
+        ``int``
     """
 
-    def __init__(self, emitter_class: type[EventEmitter], *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(timeout=timeout)
+    def __init__(
+        self,
+        emitter_class: type[EventEmitter],
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        event_queue_maxsize: int = 0,
+    ) -> None:
+        super().__init__(timeout=timeout, event_queue_maxsize=event_queue_maxsize)
         self._emitter_class = emitter_class
         self._lock = threading.RLock()
         self._watches: set[ObservedWatch] = set()
@@ -278,15 +437,21 @@ class BaseObserver(EventDispatcher):
         del self._emitter_for_watch[emitter.watch]
         self._emitters.remove(emitter)
         emitter.stop()
-        with contextlib.suppress(RuntimeError):
+        try:
             emitter.join()
+        except RuntimeError:
+            pass
+        self._event_queue.discard_watch(emitter.watch)
 
     def _clear_emitters(self) -> None:
         for emitter in self._emitters:
             emitter.stop()
         for emitter in self._emitters:
-            with contextlib.suppress(RuntimeError):
+            try:
                 emitter.join()
+            except RuntimeError:
+                pass
+        self._event_queue.discard_all_overflows()
         self._emitters.clear()
         self._emitter_for_watch.clear()
 

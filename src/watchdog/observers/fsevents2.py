@@ -249,5 +249,5 @@ class FSEventsEmitter(EventEmitter):
 
 
 class FSEventsObserver2(BaseObserver):
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(FSEventsEmitter, timeout=timeout)
+    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, event_queue_maxsize: int = 0) -> None:
+        super().__init__(FSEventsEmitter, timeout=timeout, event_queue_maxsize=event_queue_maxsize)

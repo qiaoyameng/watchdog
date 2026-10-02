@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import queue
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from watchdog.events import FileModifiedEvent, FileOpenedEvent, LoggingEventHandler
+from watchdog.events import (
+    EventQueueOverflowedEvent,
+    FileCreatedEvent,
+    FileModifiedEvent,
+    FileOpenedEvent,
+    FileSystemEvent,
+    FileSystemEventHandler,
+    LoggingEventHandler,
+)
 from watchdog.observers.api import BaseObserver, EventDispatcher, EventEmitter, EventQueue, ObservedWatch
 
 
@@ -95,6 +105,202 @@ def test_event_emitter():
     watch = ObservedWatch("/foobar", recursive=True)
     event_emitter = EventEmitter(event_queue, watch, timeout=1)
     event_emitter.queue_event(FileModifiedEvent("/foobar/blah"))
+
+
+def test_default_event_queue_remains_unbounded():
+    event_queue = EventQueue()
+    watch = ObservedWatch("/foobar", recursive=False)
+    emitter = EventEmitter(event_queue, watch)
+
+    for index in range(100):
+        emitter.queue_event(FileModifiedEvent(f"/foobar/{index}"))
+
+    assert event_queue.maxsize == 0
+    assert event_queue.qsize() == 100
+    assert not event_queue._active_overflowed_watches  # noqa: SLF001
+
+
+def test_bounded_queue_coalesces_consecutive_overflows_for_a_watch():
+    event_queue = EventQueue(maxsize=2)
+    watch = ObservedWatch("/foobar", recursive=False)
+    emitter = EventEmitter(event_queue, watch)
+
+    emitter.queue_event(FileCreatedEvent("/foobar/a"))
+    emitter.queue_event(FileModifiedEvent("/foobar/b"))
+    emitter.queue_event(FileModifiedEvent("/foobar/c"))
+    emitter.queue_event(FileModifiedEvent("/foobar/d"))
+    event_queue.mark_overflow(watch)
+
+    entries = [event_queue.get_nowait() for _ in range(3)]
+
+    assert [event for event, _ in entries] == [
+        FileCreatedEvent("/foobar/a"),
+        FileModifiedEvent("/foobar/b"),
+        EventQueueOverflowedEvent("/foobar", is_synthetic=True),
+    ]
+    assert {watch for _, watch in entries} == {watch}
+    with pytest.raises(queue.Empty):
+        event_queue.get_nowait()
+
+
+def test_bounded_queue_deduplicates_without_reporting_overflow():
+    event_queue = EventQueue(maxsize=2)
+    watch = ObservedWatch("/foobar", recursive=False)
+    emitter = EventEmitter(event_queue, watch)
+    repeated_event = FileModifiedEvent("/foobar/a")
+
+    emitter.queue_event(repeated_event)
+    emitter.queue_event(repeated_event)
+    emitter.queue_event(repeated_event)
+    emitter.queue_event(repeated_event)
+
+    entries = [event_queue.get_nowait()]
+
+    assert [event for event, _ in entries] == [FileModifiedEvent("/foobar/a")]
+    assert not event_queue._active_overflowed_watches  # noqa: SLF001
+    with pytest.raises(queue.Empty):
+        event_queue.get_nowait()
+
+
+def test_bounded_queue_delivers_overflow_after_existing_events_then_accepts_more():
+    event_queue = EventQueue(maxsize=2)
+    watch = ObservedWatch("/foobar", recursive=False)
+    emitter = EventEmitter(event_queue, watch)
+
+    emitter.queue_event(FileCreatedEvent("/foobar/a"))
+    emitter.queue_event(FileCreatedEvent("/foobar/b"))
+    emitter.queue_event(FileCreatedEvent("/foobar/lost"))
+
+    first_event, first_watch = event_queue.get_nowait()
+    second_event, second_watch = event_queue.get_nowait()
+    overflow_event, overflow_watch = event_queue.get_nowait()
+
+    assert first_event == FileCreatedEvent("/foobar/a")
+    assert second_event == FileCreatedEvent("/foobar/b")
+    assert isinstance(overflow_event, EventQueueOverflowedEvent)
+    assert overflow_event.is_synthetic
+    assert overflow_event.src_path == watch.path
+    assert (first_watch, second_watch, overflow_watch) == (watch, watch, watch)
+
+    emitter.queue_event(FileModifiedEvent("/foobar/c"))
+    following_event, following_watch = event_queue.get_nowait()
+    assert following_event == FileModifiedEvent("/foobar/c")
+    assert following_watch == watch
+
+
+def test_bounded_queue_overflow_bypasses_event_filter():
+    event_queue = EventQueue(maxsize=1)
+    watch = ObservedWatch("/foobar", recursive=False)
+    emitter = EventEmitter(event_queue, watch, event_filter=[FileCreatedEvent])
+
+    emitter.queue_event(FileCreatedEvent("/foobar/a"))
+    emitter.queue_event(FileCreatedEvent("/foobar/b"))
+
+    event, overflow_watch = event_queue.get_nowait()
+    assert event == FileCreatedEvent("/foobar/a")
+    overflow_event, _ = event_queue.get_nowait()
+    assert isinstance(overflow_event, EventQueueOverflowedEvent)
+    assert overflow_watch == watch
+
+
+def test_discarding_a_watch_releases_its_queued_overflow_for_another_watch():
+    event_queue = EventQueue(maxsize=2)
+    first_watch = ObservedWatch("/first", recursive=False)
+    second_watch = ObservedWatch("/second", recursive=False)
+    first_emitter = EventEmitter(event_queue, first_watch)
+    second_emitter = EventEmitter(event_queue, second_watch)
+
+    first_emitter.queue_event(FileModifiedEvent("/first/a"))
+    first_emitter.queue_event(FileModifiedEvent("/first/b"))
+    first_emitter.queue_event(FileModifiedEvent("/first/lost"))
+    second_emitter.queue_event(FileModifiedEvent("/second/lost"))
+
+    event_queue.get_nowait()
+    event_queue.task_done()
+
+    event_queue.discard_watch(first_watch)
+
+    retained_event, retained_watch = event_queue.get_nowait()
+    overflow_event, overflow_watch = event_queue.get_nowait()
+    assert retained_event == FileModifiedEvent("/first/b")
+    assert retained_watch == first_watch
+    assert isinstance(overflow_event, EventQueueOverflowedEvent)
+    assert overflow_watch == second_watch
+    with pytest.raises(queue.Empty):
+        event_queue.get_nowait()
+
+
+def test_bounded_observer_overflows_recovers_and_stops_without_real_disk_load():
+    class ControlledEmitter(EventEmitter):
+        def queue_events(self, timeout: float) -> None:
+            self.stopped_event.wait(0.01)
+
+    class SlowHandler(FileSystemEventHandler):
+        def __init__(self) -> None:
+            self.reached_second_event = threading.Event()
+            self.release_second_event = threading.Event()
+            self.events: list[FileSystemEvent] = []
+
+        def on_any_event(self, event: FileSystemEvent) -> None:
+            self.events.append(event)
+            if len(self.events) == 2:
+                self.reached_second_event.set()
+                self.release_second_event.wait(5)
+
+    observer = BaseObserver(ControlledEmitter, event_queue_maxsize=2)
+    handler = SlowHandler()
+    watch = observer.schedule(handler, "/foobar", recursive=True)
+    emitter = next(iter(observer.emitters))
+
+    observer.start()
+    try:
+        emitter.queue_event(FileCreatedEvent("/foobar/a"))
+        emitter.queue_event(FileCreatedEvent("/foobar/b"))
+        emitter.queue_event(FileCreatedEvent("/foobar/lost"))
+        emitter.queue_event(FileCreatedEvent("/foobar/lost-too"))
+
+        assert handler.reached_second_event.wait(5)
+        emitter.queue_event(FileModifiedEvent("/foobar/after-gap"))
+        handler.release_second_event.set()
+
+        deadline = time.monotonic() + 5
+        while len(handler.events) < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert [type(event) for event in handler.events] == [
+            FileCreatedEvent,
+            FileCreatedEvent,
+            EventQueueOverflowedEvent,
+            FileModifiedEvent,
+        ]
+        assert handler.events[2].src_path == watch.path
+    finally:
+        observer.stop()
+        observer.join(5)
+
+    assert not observer.is_alive()
+    assert observer.event_queue.empty()
+
+
+def test_bounded_observer_stop_wakes_when_queue_is_full():
+    class ControlledEmitter(EventEmitter):
+        def queue_events(self, timeout: float) -> None:
+            self.stopped_event.wait(0.01)
+
+    observer = BaseObserver(ControlledEmitter, event_queue_maxsize=2)
+    watch = observer.schedule(LoggingEventHandler(), "/foobar", recursive=True)
+    emitter = next(iter(observer.emitters))
+
+    observer.start()
+    emitter.queue_event(FileModifiedEvent("/foobar/a"))
+    emitter.queue_event(FileModifiedEvent("/foobar/b"))
+    emitter.queue_event(FileModifiedEvent("/foobar/lost"))
+
+    observer.stop()
+    observer.join(5)
+
+    assert not observer.is_alive()
+    assert watch not in observer._emitter_for_watch  # noqa: SLF001
 
 
 def test_event_dispatcher():
