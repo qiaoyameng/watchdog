@@ -3,15 +3,19 @@ from __future__ import annotations
 import contextlib
 import queue
 import threading
+import time
 from collections import defaultdict
+from collections.abc import Sequence
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from watchdog.utils import BaseThread
 from watchdog.utils.bricks import SkipRepeatsQueue
 
 if TYPE_CHECKING:
     import types
+    from collections.abc import Iterable, Mapping
 
     from typing_extensions import Self
 
@@ -19,6 +23,7 @@ if TYPE_CHECKING:
 
 DEFAULT_EMITTER_TIMEOUT = 1.0  # in seconds
 DEFAULT_OBSERVER_TIMEOUT = 1.0  # in seconds
+DEFAULT_BATCH_MAX_WAIT = 1.0  # in seconds
 
 
 class EventQueue(SkipRepeatsQueue):
@@ -114,6 +119,68 @@ class ObservedWatch:
         else:
             event_filter_str = ""
         return f"<{type(self).__name__}: path={self.path!r}, is_recursive={self.is_recursive}{event_filter_str}>"
+
+
+class EventBatch(Sequence):
+    """A read-only, ordered sequence of ``(event, watch)`` entries dispatched
+    together as a single batch by :meth:`BaseObserver.dispatch_event_batch`.
+
+    Entries keep the order in which they were dequeued (which is the order in
+    which they were enqueued by emitters). The batch is immutable: handlers
+    receiving it cannot modify its content.
+    """
+
+    def __init__(self, entries: Iterable[tuple[FileSystemEvent, ObservedWatch]]) -> None:
+        self._entries = tuple(entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __getitem__(self, index):
+        return self._entries[index]
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    @property
+    def events(self) -> tuple[FileSystemEvent, ...]:
+        """The events of this batch, in enqueue order."""
+        return tuple(event for event, _ in self._entries)
+
+    @property
+    def watches(self) -> tuple[ObservedWatch, ...]:
+        """The watches of this batch, in enqueue order."""
+        return tuple(watch for _, watch in self._entries)
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__}: entries={self._entries!r}>"
+
+
+class BatchErrorPolicy(Enum):
+    """Policy applied by :meth:`BaseObserver.dispatch_event_batch` when an
+    event handler raises an exception while processing a batch.
+    """
+
+    CONTINUE = "continue"
+    """Record the failure in :attr:`BaseObserver.batch_errors` and keep
+    dispatching the remaining handlers of the batch."""
+
+    ABORT = "abort"
+    """Record the failure in :attr:`BaseObserver.batch_errors` and stop
+    dispatching the rest of the batch."""
+
+
+class BatchDispatchError(NamedTuple):
+    """Record of an event handler failure during batch dispatch."""
+
+    handler: FileSystemEventHandler
+    """The handler that raised."""
+
+    batch: EventBatch
+    """The (sub-)batch the handler was called with."""
+
+    exception: Exception
+    """The exception raised by the handler."""
 
 
 # Observer classes
@@ -259,16 +326,50 @@ class BaseObserver(EventDispatcher):
         The timeout (in seconds) for the observer to wait on events.
     :type timeout:
         ``float``
+    :param batch_size:
+        Optional maximum number of events dispatched together as a single
+        read-only :class:`EventBatch`. When ``None`` (default), events are
+        dispatched one at a time, preserving the historical behavior.
+    :type batch_size:
+        ``int`` | ``None``
+    :param batch_max_wait:
+        Maximum time (in seconds) spent collecting a batch before dispatching
+        whatever has been collected. Only used when ``batch_size`` is set.
+    :type batch_max_wait:
+        ``float``
+    :param batch_error_policy:
+        Policy applied when an event handler raises during batch dispatch.
+        Only used when ``batch_size`` is set.
+    :type batch_error_policy:
+        :class:`BatchErrorPolicy`
     """
 
-    def __init__(self, emitter_class: type[EventEmitter], *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
+    def __init__(
+        self,
+        emitter_class: type[EventEmitter],
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        batch_size: int | None = None,
+        batch_max_wait: float = DEFAULT_BATCH_MAX_WAIT,
+        batch_error_policy: BatchErrorPolicy = BatchErrorPolicy.CONTINUE,
+    ) -> None:
         super().__init__(timeout=timeout)
+        if batch_size is not None and batch_size < 1:
+            error_message = "batch_size must be a positive integer or None"
+            raise ValueError(error_message)
+        if batch_size is not None and batch_max_wait <= 0:
+            error_message = "batch_max_wait must be greater than zero"
+            raise ValueError(error_message)
         self._emitter_class = emitter_class
         self._lock = threading.RLock()
         self._watches: set[ObservedWatch] = set()
         self._handlers: defaultdict[ObservedWatch, set[FileSystemEventHandler]] = defaultdict(set)
         self._emitters: set[EventEmitter] = set()
         self._emitter_for_watch: dict[ObservedWatch, EventEmitter] = {}
+        self._batch_size = batch_size
+        self._batch_max_wait = batch_max_wait
+        self._batch_error_policy = batch_error_policy
+        self._batch_errors: list[BatchDispatchError] = []
 
     def _add_emitter(self, emitter: EventEmitter) -> None:
         self._emitter_for_watch[emitter.watch] = emitter
@@ -300,6 +401,27 @@ class BaseObserver(EventDispatcher):
     def emitters(self) -> set[EventEmitter]:
         """Returns event emitter created by this observer."""
         return self._emitters
+
+    @property
+    def batch_size(self) -> int | None:
+        """Maximum number of events dispatched per batch, or ``None`` when
+        batched dispatching is disabled."""
+        return self._batch_size
+
+    @property
+    def batch_max_wait(self) -> float:
+        """Maximum time (in seconds) spent collecting a single batch."""
+        return self._batch_max_wait
+
+    @property
+    def batch_error_policy(self) -> BatchErrorPolicy:
+        """Policy applied when an event handler raises during batch dispatch."""
+        return self._batch_error_policy
+
+    @property
+    def batch_errors(self) -> tuple[BatchDispatchError, ...]:
+        """Failures recorded while dispatching batches, in recording order."""
+        return tuple(self._batch_errors)
 
     def start(self) -> None:
         for emitter in self._emitters.copy():
@@ -441,6 +563,10 @@ class BaseObserver(EventDispatcher):
         self.unschedule_all()
 
     def dispatch_events(self, event_queue: EventQueue) -> None:
+        if self._batch_size is not None:
+            self._dispatch_events_batched(event_queue)
+            return
+
         entry = event_queue.get(block=True)
         if entry is EventDispatcher.stop_event:
             event_queue.task_done()
@@ -459,3 +585,97 @@ class BaseObserver(EventDispatcher):
                 if handler in self._handlers.get(watch, ()):
                     handler.dispatch(event)
         event_queue.task_done()
+
+    def _dispatch_events_batched(self, event_queue: EventQueue) -> None:
+        # Snapshot the subscriptions *before* collecting the batch: the
+        # snapshot defines the batch boundaries. Any subscription change
+        # (schedule/unschedule/stop) made while the batch is being collected
+        # or dispatched only takes effect at the start of the next batch.
+        # The lock is only held for the duration of the copy, never while
+        # blocking on the queue or running handler callbacks.
+        with self._lock:
+            handlers = {watch: tuple(watch_handlers) for watch, watch_handlers in self._handlers.items()}
+
+        entries = self._collect_batch(event_queue)
+        if not entries:
+            return
+
+        batch = EventBatch(entries)
+        try:
+            self.dispatch_event_batch(batch, handlers)
+        finally:
+            # Acknowledge every dequeued entry exactly once, even when a
+            # handler fails, so that ``event_queue.join()`` can complete.
+            for _ in batch:
+                event_queue.task_done()
+
+    def _collect_batch(self, event_queue: EventQueue) -> list[tuple[FileSystemEvent, ObservedWatch]]:
+        """Collects up to ``batch_size`` entries from the queue, waiting at
+        most ``batch_max_wait`` seconds in total for the batch to fill.
+
+        A requested stop truncates the collection: the entries gathered so
+        far still form the final batch, and the stop itself is acknowledged
+        so that queue bookkeeping stays balanced.
+        """
+        entries: list[tuple[FileSystemEvent, ObservedWatch]] = []
+        deadline = time.monotonic() + self._batch_max_wait
+        while len(entries) < self._batch_size:
+            remaining = deadline - time.monotonic()
+            if entries and remaining <= 0:
+                break
+            try:
+                entry = event_queue.get(block=True, timeout=max(remaining, 0.0))
+            except queue.Empty:
+                break
+            if entry is EventDispatcher.stop_event:
+                event_queue.task_done()
+                break
+            entries.append(entry)
+        return entries
+
+    def dispatch_event_batch(
+        self,
+        batch: EventBatch,
+        handlers: Mapping[ObservedWatch, tuple[FileSystemEventHandler, ...]],
+    ) -> None:
+        """Dispatches a read-only batch of events to the subscribed handlers.
+
+        Events are grouped per watch (preserving enqueue order within each
+        watch) and every subscribed handler is called once per watch with a
+        read-only :class:`EventBatch` via its ``dispatch_batch`` method.
+        Handlers that do not implement ``dispatch_batch`` receive each event
+        individually through ``dispatch``, in enqueue order.
+
+        :param batch:
+            The read-only batch of events to dispatch.
+        :type batch:
+            :class:`EventBatch`
+        :param handlers:
+            Read-only snapshot of the subscriptions taken at the start of the
+            batch. Subscription changes made while dispatching only apply to
+            the next batch.
+        :type handlers:
+            Mapping[:class:`ObservedWatch`, tuple of handlers]
+        """
+        entries_by_watch: dict[ObservedWatch, list[tuple[FileSystemEvent, ObservedWatch]]] = {}
+        for entry in batch:
+            entries_by_watch.setdefault(entry[1], []).append(entry)
+
+        for watch, watch_entries in entries_by_watch.items():
+            watch_batch = EventBatch(watch_entries)
+            for handler in handlers.get(watch, ()):
+                try:
+                    self._dispatch_batch_to_handler(handler, watch_batch)
+                except Exception as exc:
+                    self._batch_errors.append(BatchDispatchError(handler=handler, batch=watch_batch, exception=exc))
+                    if self._batch_error_policy is BatchErrorPolicy.ABORT:
+                        return
+
+    @staticmethod
+    def _dispatch_batch_to_handler(handler: FileSystemEventHandler, batch: EventBatch) -> None:
+        dispatch_batch = getattr(handler, "dispatch_batch", None)
+        if dispatch_batch is not None:
+            dispatch_batch(batch)
+        else:
+            for event in batch.events:
+                handler.dispatch(event)

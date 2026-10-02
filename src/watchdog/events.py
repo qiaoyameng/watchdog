@@ -92,6 +92,8 @@ from watchdog.utils.patterns import match_any_paths
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from watchdog.observers.api import EventBatch
+
 EVENT_TYPE_MOVED = "moved"
 EVENT_TYPE_DELETED = "deleted"
 EVENT_TYPE_CREATED = "created"
@@ -225,6 +227,22 @@ class FileSystemEventHandler:
         """
         self.on_any_event(event)
         getattr(self, f"on_{event.event_type}")(event)
+
+    def dispatch_batch(self, batch: EventBatch) -> None:
+        """Dispatches a read-only batch of events.
+
+        Called by observers configured with batched dispatching. The default
+        implementation dispatches each event of the batch individually, in
+        enqueue order, via :meth:`dispatch`. Override this method to process
+        the whole :class:`watchdog.observers.api.EventBatch` at once.
+
+        :param batch:
+            The read-only batch of events to dispatch.
+        :type batch:
+            :class:`watchdog.observers.api.EventBatch`
+        """
+        for event in batch.events:
+            self.dispatch(event)
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         """Catch-all event handler.

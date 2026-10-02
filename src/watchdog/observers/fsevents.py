@@ -28,7 +28,14 @@ from watchdog.events import (
     generate_sub_created_events,
     generate_sub_moved_events,
 )
-from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIMEOUT, BaseObserver, EventEmitter
+from watchdog.observers.api import (
+    DEFAULT_BATCH_MAX_WAIT,
+    DEFAULT_EMITTER_TIMEOUT,
+    DEFAULT_OBSERVER_TIMEOUT,
+    BaseObserver,
+    BatchErrorPolicy,
+    EventEmitter,
+)
 from watchdog.utils.dirsnapshot import DirectorySnapshot
 
 if TYPE_CHECKING:
@@ -322,8 +329,21 @@ class FSEventsEmitter(EventEmitter):
 
 
 class FSEventsObserver(BaseObserver):
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(FSEventsEmitter, timeout=timeout)
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        batch_size: int | None = None,
+        batch_max_wait: float = DEFAULT_BATCH_MAX_WAIT,
+        batch_error_policy: BatchErrorPolicy = BatchErrorPolicy.CONTINUE,
+    ) -> None:
+        super().__init__(
+            FSEventsEmitter,
+            timeout=timeout,
+            batch_size=batch_size,
+            batch_max_wait=batch_max_wait,
+            batch_error_policy=batch_error_policy,
+        )
 
     def schedule(
         self,

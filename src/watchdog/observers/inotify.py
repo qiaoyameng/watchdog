@@ -91,7 +91,14 @@ from watchdog.events import (
     generate_sub_created_events,
     generate_sub_moved_events,
 )
-from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIMEOUT, BaseObserver, EventEmitter
+from watchdog.observers.api import (
+    DEFAULT_BATCH_MAX_WAIT,
+    DEFAULT_EMITTER_TIMEOUT,
+    DEFAULT_OBSERVER_TIMEOUT,
+    BaseObserver,
+    BatchErrorPolicy,
+    EventEmitter,
+)
 from watchdog.observers.inotify_c import (
     WATCHDOG_ALL_EVENTS,
     CallbackId,
@@ -551,6 +558,20 @@ class InotifyObserver(BaseObserver):
     calls to event handlers.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, generate_full_events: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        generate_full_events: bool = False,
+        batch_size: int | None = None,
+        batch_max_wait: float = DEFAULT_BATCH_MAX_WAIT,
+        batch_error_policy: BatchErrorPolicy = BatchErrorPolicy.CONTINUE,
+    ) -> None:
         cls = InotifyFullEmitter if generate_full_events else InotifyEmitter
-        super().__init__(cls, timeout=timeout)
+        super().__init__(
+            cls,
+            timeout=timeout,
+            batch_size=batch_size,
+            batch_max_wait=batch_max_wait,
+            batch_error_policy=batch_error_policy,
+        )

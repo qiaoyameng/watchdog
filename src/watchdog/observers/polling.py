@@ -36,7 +36,14 @@ from watchdog.events import (
     FileModifiedEvent,
     FileMovedEvent,
 )
-from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIMEOUT, BaseObserver, EventEmitter
+from watchdog.observers.api import (
+    DEFAULT_BATCH_MAX_WAIT,
+    DEFAULT_EMITTER_TIMEOUT,
+    DEFAULT_OBSERVER_TIMEOUT,
+    BaseObserver,
+    BatchErrorPolicy,
+    EventEmitter,
+)
 from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff, EmptyDirectorySnapshot
 
 if TYPE_CHECKING:
@@ -123,8 +130,21 @@ class PollingObserver(BaseObserver):
     system changes.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(PollingEmitter, timeout=timeout)
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        batch_size: int | None = None,
+        batch_max_wait: float = DEFAULT_BATCH_MAX_WAIT,
+        batch_error_policy: BatchErrorPolicy = BatchErrorPolicy.CONTINUE,
+    ) -> None:
+        super().__init__(
+            PollingEmitter,
+            timeout=timeout,
+            batch_size=batch_size,
+            batch_max_wait=batch_max_wait,
+            batch_error_policy=batch_error_policy,
+        )
 
 
 class PollingObserverVFS(BaseObserver):
