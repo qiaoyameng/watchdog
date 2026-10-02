@@ -25,6 +25,64 @@ SLEEP_TIME = 0.4
 TEMP_DIR = mkdtemp()
 
 
+def test_set_prune_dirs_rebuilds_baseline_without_spurious_deletes(tmp_path):
+    # Switching the prune rules at runtime must rebuild the comparison
+    # baseline explicitly so files hidden by the new rules are not emitted as
+    # a batch of deletions on the next poll.
+    mkdir(str(tmp_path / "cache"))
+    touch(str(tmp_path / "cache" / "a"))
+    touch(str(tmp_path / "keep"))
+
+    watch = ObservedWatch(str(tmp_path), recursive=True)
+    queue = Queue()
+    emitter = Emitter(queue, watch, timeout=0)
+
+    emitter.on_thread_start()
+    assert str(tmp_path / "cache" / "a") in emitter._snapshot.paths
+
+    # Change the rules and explicitly rebuild the baseline.
+    emitter.set_prune_dirs(["cache"])
+    assert str(tmp_path / "cache" / "a") not in emitter._snapshot.paths
+
+    # The next poll compares two snapshots built under the same rules.
+    emitter.queue_events(0)
+
+    paths = set()
+    while True:
+        try:
+            event, _watch = queue.get_nowait()
+            paths.add(event.src_path)
+        except Empty:
+            break
+    assert str(tmp_path / "cache") not in paths
+    assert str(tmp_path / "cache" / "a") not in paths
+
+    # A real change outside the pruned subtree is still detected.
+    touch(str(tmp_path / "new"))
+    emitter.queue_events(0)
+    events = []
+    while True:
+        try:
+            event, _watch = queue.get_nowait()
+            events.append(event)
+        except Empty:
+            break
+    assert any(event.src_path == str(tmp_path / "new") for event in events)
+
+
+def test_emitter_accepts_initial_prune_dirs(tmp_path):
+    mkdir(str(tmp_path / "cache"))
+    touch(str(tmp_path / "cache" / "a"))
+    touch(str(tmp_path / "keep"))
+
+    watch = ObservedWatch(str(tmp_path), recursive=True)
+    emitter = Emitter(Queue(), watch, timeout=0, prune_dirs=["cache"])
+    emitter.on_thread_start()
+
+    assert str(tmp_path / "cache" / "a") not in emitter._snapshot.paths
+    assert str(tmp_path / "keep") in emitter._snapshot.paths
+
+
 def p(*args):
     """
     Convenience function to join the temporary directory path

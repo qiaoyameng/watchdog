@@ -218,3 +218,105 @@ def test_empty_snapshot(p):
     assert len(diff) == 4
     assert diff.files_created == [p("a")]
     assert sorted(diff.dirs_created) == sorted([p(""), p("b"), p("b", "c")])
+
+
+def test_prune_dirs_skips_whole_subtree(p):
+    # A pruned directory is never entered: its listdir is not called, it is
+    # not stat-ed and neither it nor its contents appear in the snapshot.
+    mkdir(p("cache", "sub"), parents=True)
+    touch(p("cache", "a"))
+    touch(p("cache", "sub", "b"))
+    mkdir(p("keep"))
+    touch(p("keep", "c"))
+
+    entered = []
+
+    def listdir_fcn(path):
+        entered.append(path)
+        return os.scandir(path)
+
+    snapshot = DirectorySnapshot(p(""), listdir=listdir_fcn, prune_dirs=["cache"])
+
+    assert p("cache") not in snapshot.paths
+    assert p("cache", "a") not in snapshot.paths
+    assert p("cache", "sub") not in snapshot.paths
+    assert p("cache", "sub", "b") not in snapshot.paths
+    assert p("keep") in snapshot.paths
+    assert p("keep", "c") in snapshot.paths
+    # The root and "keep" were listed, but "cache" was never entered.
+    assert p("cache") not in entered
+    assert p("") in entered
+    assert p("keep") in entered
+
+
+def test_prune_dirs_relative_path_with_separators(p):
+    # Rules are relative to the snapshot root and accept POSIX separators
+    # even when expressed as nested paths.
+    mkdir(p("build", "cache", "x"), parents=True)
+    touch(p("build", "cache", "x", "f"))
+    touch(p("build", "out"))
+
+    entered = []
+
+    def listdir_fcn(path):
+        entered.append(path)
+        return os.scandir(path)
+
+    snapshot = DirectorySnapshot(p(""), listdir=listdir_fcn, prune_dirs=["build/cache"])
+
+    assert p("build", "cache") not in snapshot.paths
+    assert p("build", "cache", "x", "f") not in snapshot.paths
+    assert p("build", "out") in snapshot.paths
+    assert p("build", "cache") not in entered
+
+
+def test_prune_dirs_evaluated_before_entering_on_error(p):
+    # Pruning is decided before the directory is entered, so an unreadable
+    # pruned directory does not surface any error during the scan.
+    mkdir(p("cache"))
+    touch(p("cache", "a"))
+
+    def listdir_fcn(path):
+        if path == p("cache"):
+            raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+        return os.scandir(path)
+
+    snapshot = DirectorySnapshot(p(""), listdir=listdir_fcn, prune_dirs=["cache"])
+    assert p("cache") not in snapshot.paths
+    assert p("cache", "a") not in snapshot.paths
+
+
+def test_prune_dirs_do_not_affect_sibling_files(p):
+    # File filtering and directory pruning are separate concerns: pruning a
+    # directory never excludes unrelated files.
+    mkdir(p("cache"))
+    touch(p("cache", "a"))
+    touch(p("cache.txt"))
+
+    snapshot = DirectorySnapshot(p(""), prune_dirs=["cache"])
+    assert p("cache") not in snapshot.paths
+    assert p("cache.txt") in snapshot.paths
+
+
+def test_prune_dirs_switch_requires_baseline_rebuild(p):
+    # Comparing snapshots taken under different prune rules naively reports the
+    # newly hidden files as deletions; rebuilding the baseline with the new
+    # rules produces no spurious deletions.
+    mkdir(p("cache"))
+    touch(p("cache", "a"))
+    touch(p("keep"))
+
+    ref = DirectorySnapshot(p(""))
+    pruned = DirectorySnapshot(p(""), prune_dirs=["cache"])
+
+    naive_diff = DirectorySnapshotDiff(ref, pruned)
+    assert naive_diff.files_deleted == [p("cache", "a")]
+    assert naive_diff.dirs_deleted == [p("cache")]
+
+    # Explicitly rebuild the comparison baseline using the new rules.
+    rebuilt = DirectorySnapshot(p(""), prune_dirs=["cache"])
+    diff = DirectorySnapshotDiff(pruned, rebuilt)
+    assert diff.files_deleted == []
+    assert diff.dirs_deleted == []
+    assert diff.files_created == []
+    assert diff.dirs_created == []

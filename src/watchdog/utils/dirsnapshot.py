@@ -38,7 +38,7 @@ from stat import S_ISDIR
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
     from typing import Any, Callable
 
 
@@ -225,6 +225,17 @@ class DirectorySnapshotDiff:
             for every entry in the directory tree.
         :param listdir:
             Use custom listdir function. For details see ``os.scandir``.
+        :param prune_dirs:
+            Directory paths to exclude from the snapshot. Paths are relative to
+            the snapshotted root (for example ``"build/cache"``); they may use
+            either POSIX or platform-native separators. When a directory is
+            pruned the whole subtree is skipped: neither the directory itself
+            nor anything beneath it is listed or stat-ed, so it never appears
+            in the snapshot. Matching follows the platform semantics
+            (case-insensitive on Windows, case-sensitive elsewhere), and
+            symlinks to directories are matched just like regular directories.
+        :type prune_dirs:
+            iterable of ``str``
         :param ignore_device:
             A boolean indicating whether to ignore the device id or not.
             By default, a file may be uniquely identified by a combination of its first
@@ -244,12 +255,14 @@ class DirectorySnapshotDiff:
             recursive: bool = True,
             stat: Callable[[str], os.stat_result] = os.stat,
             listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+            prune_dirs: Iterable[str] = (),
             ignore_device: bool = False,
         ) -> None:
             self.path = path
             self.recursive = recursive
             self.stat = stat
             self.listdir = listdir
+            self.prune_dirs = tuple(prune_dirs)
             self.ignore_device = ignore_device
 
         def __enter__(self) -> None:
@@ -269,6 +282,7 @@ class DirectorySnapshotDiff:
                 recursive=self.recursive,
                 stat=self.stat,
                 listdir=self.listdir,
+                prune_dirs=self.prune_dirs,
             )
 
 
@@ -292,6 +306,17 @@ class DirectorySnapshot:
         for every entry in the directory tree.
     :param listdir:
         Use custom listdir function. For details see ``os.scandir``.
+    :param prune_dirs:
+        Directory paths to exclude from the snapshot. Paths are relative to
+        the snapshotted root (for example ``"build/cache"``); they may use
+        either POSIX or platform-native separators. When a directory is
+        pruned the whole subtree is skipped: neither the directory itself nor
+        anything beneath it is listed or stat-ed, so it never appears in the
+        snapshot. Matching follows the platform semantics
+        (case-insensitive on Windows, case-sensitive elsewhere), and symlinks
+        to directories are matched just like regular directories.
+    :type prune_dirs:
+        iterable of ``str``
     """
 
     def __init__(
@@ -301,10 +326,18 @@ class DirectorySnapshot:
         recursive: bool = True,
         stat: Callable[[str], os.stat_result] = os.stat,
         listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        prune_dirs: Iterable[str] = (),
     ) -> None:
         self.recursive = recursive
         self.stat = stat
         self.listdir = listdir
+        self.root_path = path
+        self.prune_dirs = tuple(prune_dirs)
+        # Normalize once with the same rules the platform uses for path
+        # comparisons (case folding on Windows, literal elsewhere).
+        self._pruned_paths = {
+            os.path.normcase(os.path.normpath(rule.strip("/\\") or ".")) for rule in self.prune_dirs
+        }
 
         self._stat_info: dict[bytes | str, os.stat_result] = {}
         self._inode_to_path: dict[tuple[int, int], bytes | str] = {}
@@ -333,6 +366,10 @@ class DirectorySnapshot:
 
         entries = []
         for p in paths:
+            if self._is_pruned(p):
+                # Exclude the whole subtree before entering the directory:
+                # it is neither stat-ed nor listed.
+                continue
             with contextlib.suppress(OSError):
                 entry = (p, self.stat(p))
                 entries.append(entry)
@@ -343,6 +380,14 @@ class DirectorySnapshot:
                 with contextlib.suppress(PermissionError):
                     if S_ISDIR(st.st_mode):
                         yield from self.walk(path)
+
+    def _is_pruned(self, path: str) -> bool:
+        """Return ``True`` if ``path`` is a directory excluded by the prune
+        rules. Rules are relative to the snapshot root and are evaluated
+        before the directory is entered.
+        """
+        relpath = os.path.relpath(path, self.root_path)
+        return os.path.normcase(os.path.normpath(relpath)) in self._pruned_paths
 
     @property
     def paths(self) -> set[bytes | str]:

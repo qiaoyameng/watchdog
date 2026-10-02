@@ -40,7 +40,7 @@ from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIM
 from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff, EmptyDirectorySnapshot
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
     from typing import Callable
 
     from watchdog.events import FileSystemEvent
@@ -61,19 +61,34 @@ class PollingEmitter(EventEmitter):
         event_filter: list[type[FileSystemEvent]] | None = None,
         stat: Callable[[str], os.stat_result] = os.stat,
         listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        prune_dirs: Iterable[str] = (),
     ) -> None:
         super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
         self._snapshot: DirectorySnapshot = EmptyDirectorySnapshot()
         self._lock = threading.Lock()
+        self._prune_dirs = tuple(prune_dirs)
         self._take_snapshot: Callable[[], DirectorySnapshot] = lambda: DirectorySnapshot(
             self.watch.path,
             recursive=self.watch.is_recursive,
             stat=stat,
             listdir=listdir,
+            prune_dirs=self._prune_dirs,
         )
 
     def on_thread_start(self) -> None:
         self._snapshot = self._take_snapshot()
+
+    def set_prune_dirs(self, prune_dirs: Iterable[str]) -> None:
+        """Replace the directory prune rules and rebuild the comparison
+        baseline.
+
+        The new snapshot becomes the reference for the next poll, so files
+        hidden by the new rules are not reported as deleted. This must be
+        called explicitly whenever the rules change at runtime.
+        """
+        with self._lock:
+            self._prune_dirs = tuple(prune_dirs)
+            self._snapshot = self._take_snapshot()
 
     def queue_events(self, timeout: float) -> None:
         # We don't want to hit the disk continuously.
