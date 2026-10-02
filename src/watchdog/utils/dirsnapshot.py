@@ -42,6 +42,13 @@ if TYPE_CHECKING:
     from typing import Any, Callable
 
 
+def _sort_paths(paths: set[bytes | str]) -> list[bytes | str]:
+    try:
+        return sorted(paths)
+    except TypeError:
+        return sorted(paths, key=lambda path: repr(path))
+
+
 class DirectorySnapshotDiff:
     """Compares two directory snapshots and creates an object that represents
     the difference between the two snapshots.
@@ -63,7 +70,20 @@ class DirectorySnapshotDiff:
         to think a file has been deleted and created again but it would be the
         exact same file.
         Set to True only if you are sure you will always use the same device.
+        This only removes the device component from identity; it does not make
+        inode numbers from different devices safe to compare.
     :type ignore_device:
+        :class:`bool`
+    :param link_aware:
+        Follow all paths for a hard-linked inode instead of retaining only one
+        path. Unchanged paths are kept first. Remaining deleted and created paths
+        are paired as moves only when both sides have the same number of paths
+        for an inode. Pairs are selected by sorting both path sets, so snapshots
+        traversed in different orders produce the same result. If a move cannot
+        be identified unambiguously, the paths are reported as created and
+        deleted. Device ids remain part of the identity unless
+        ``ignore_device`` is set.
+    :type link_aware:
         :class:`bool`
     """
 
@@ -73,6 +93,7 @@ class DirectorySnapshotDiff:
         snapshot: DirectorySnapshot,
         *,
         ignore_device: bool = False,
+        link_aware: bool = False,
     ) -> None:
         created = snapshot.paths - ref.paths
         deleted = ref.paths - snapshot.paths
@@ -87,51 +108,83 @@ class DirectorySnapshotDiff:
             def get_inode(directory: DirectorySnapshot, full_path: bytes | str) -> int | tuple[int, int]:
                 return directory.inode(full_path)
 
-        # check that all unchanged paths have the same inode
-        for path in ref.paths & snapshot.paths:
+        # Check unchanged paths before looking for moves. In link-aware mode this
+        # leaves only paths which actually disappeared or appeared.
+        common_paths = ref.paths & snapshot.paths
+        unchanged_paths: set[bytes | str] = set()
+        for path in common_paths:
             if get_inode(ref, path) != get_inode(snapshot, path):
                 created.add(path)
                 deleted.add(path)
+            else:
+                unchanged_paths.add(path)
 
         # find moved paths
         moved: set[tuple[bytes | str, bytes | str]] = set()
-        for path in set(deleted):
-            inode = ref.inode(path)
-            new_path = snapshot.path(inode)
-            if new_path:
-                # file is not deleted but moved
-                deleted.remove(path)
-                moved.add((path, new_path))
+        if link_aware:
+            deleted_by_inode: dict[int | tuple[int, int], set[bytes | str]] = {}
+            created_by_inode: dict[int | tuple[int, int], set[bytes | str]] = {}
+            for path in deleted:
+                deleted_by_inode.setdefault(get_inode(ref, path), set()).add(path)
+            for path in created:
+                created_by_inode.setdefault(get_inode(snapshot, path), set()).add(path)
 
-        for path in set(created):
-            inode = snapshot.inode(path)
-            old_path = ref.path(inode)
-            if old_path:
-                created.remove(path)
-                moved.add((old_path, path))
+            for inode in deleted_by_inode.keys() | created_by_inode.keys():
+                old_paths = deleted_by_inode.get(inode, set())
+                new_paths = created_by_inode.get(inode, set())
+
+                # Only an exact one-to-one correspondence proves a rename at the
+                # snapshot level. Different counts can represent link creation or
+                # removal, so leave those paths as explicit create/delete events.
+                if len(old_paths) == len(new_paths) and old_paths and new_paths:
+                    for old_path, new_path in zip(_sort_paths(old_paths), _sort_paths(new_paths)):
+                        deleted.discard(old_path)
+                        created.discard(new_path)
+                        moved.add((old_path, new_path))
+        else:
+            for path in set(deleted):
+                inode = get_inode(ref, path)
+                new_path = snapshot.path(inode)
+                if new_path:
+                    deleted.remove(path)
+                    moved.add((path, new_path))
+
+            for path in set(created):
+                inode = get_inode(snapshot, path)
+                old_path = ref.path(inode)
+                if old_path:
+                    created.remove(path)
+                    moved.add((old_path, path))
 
         # find modified paths
-        # first check paths that have not moved
+        # First check paths that did not move. In link-aware mode this records a
+        # content change at every remaining path for the inode rather than only
+        # the arbitrary path retained by an inode-to-path mapping.
         modified: set[bytes | str] = set()
-        for path in ref.paths & snapshot.paths:
-            if get_inode(ref, path) == get_inode(snapshot, path) and (
+        for path in unchanged_paths:
+            if (
                 ref.mtime(path) != snapshot.mtime(path) or ref.size(path) != snapshot.size(path)
             ):
                 modified.add(path)
 
         for old_path, new_path in moved:
             if ref.mtime(old_path) != snapshot.mtime(new_path) or ref.size(old_path) != snapshot.size(new_path):
-                modified.add(old_path)
+                modified.add(new_path if link_aware else old_path)
 
-        self._dirs_created = [path for path in created if snapshot.isdir(path)]
-        self._dirs_deleted = [path for path in deleted if ref.isdir(path)]
-        self._dirs_modified = [path for path in modified if ref.isdir(path)]
-        self._dirs_moved = [(frm, to) for (frm, to) in moved if ref.isdir(frm)]
+        self._dirs_created = _sort_paths({path for path in created if snapshot.isdir(path)})
+        self._dirs_deleted = _sort_paths({path for path in deleted if ref.isdir(path)})
+        self._dirs_modified = _sort_paths(
+            {path for path in modified if (snapshot if link_aware else ref).isdir(path)}
+        )
+        self._dirs_moved = sorted(
+            ((frm, to) for (frm, to) in moved if ref.isdir(frm)),
+            key=repr,
+        )
 
-        self._files_created = list(created - set(self._dirs_created))
-        self._files_deleted = list(deleted - set(self._dirs_deleted))
-        self._files_modified = list(modified - set(self._dirs_modified))
-        self._files_moved = list(moved - set(self._dirs_moved))
+        self._files_created = _sort_paths(created - set(self._dirs_created))
+        self._files_deleted = _sort_paths(deleted - set(self._dirs_deleted))
+        self._files_modified = _sort_paths(modified - set(self._dirs_modified))
+        self._files_moved = sorted(moved - set(self._dirs_moved), key=repr)
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -235,6 +288,11 @@ class DirectorySnapshotDiff:
             Set to True only if you are sure you will always use the same device.
         :type ignore_device:
             :class:`bool`
+        :param link_aware:
+            Track all paths for hard-linked inodes and use stable move pairing.
+            See :class:`DirectorySnapshotDiff` for details.
+        :type link_aware:
+            :class:`bool`
         """
 
         def __init__(
@@ -245,12 +303,14 @@ class DirectorySnapshotDiff:
             stat: Callable[[str], os.stat_result] = os.stat,
             listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
             ignore_device: bool = False,
+            link_aware: bool = False,
         ) -> None:
             self.path = path
             self.recursive = recursive
             self.stat = stat
             self.listdir = listdir
             self.ignore_device = ignore_device
+            self.link_aware = link_aware
 
         def __enter__(self) -> None:
             self.pre_snapshot = self.get_snapshot()
@@ -261,6 +321,7 @@ class DirectorySnapshotDiff:
                 self.pre_snapshot,
                 self.post_snapshot,
                 ignore_device=self.ignore_device,
+                link_aware=self.link_aware,
             )
 
         def get_snapshot(self) -> DirectorySnapshot:
@@ -307,15 +368,15 @@ class DirectorySnapshot:
         self.listdir = listdir
 
         self._stat_info: dict[bytes | str, os.stat_result] = {}
-        self._inode_to_path: dict[tuple[int, int], bytes | str] = {}
+        self._inode_to_paths: dict[tuple[int, int], set[bytes | str]] = {}
 
         st = self.stat(path)
         self._stat_info[path] = st
-        self._inode_to_path[(st.st_ino, st.st_dev)] = path
+        self._inode_to_paths.setdefault((st.st_ino, st.st_dev), set()).add(path)
 
         for p, st in self.walk(path):
             i = (st.st_ino, st.st_dev)
-            self._inode_to_path[i] = p
+            self._inode_to_paths.setdefault(i, set()).add(p)
             self._stat_info[p] = st
 
     def walk(self, root: str) -> Iterator[tuple[str, os.stat_result]]:
@@ -349,9 +410,29 @@ class DirectorySnapshot:
         """Set of file/directory paths in the snapshot."""
         return set(self._stat_info.keys())
 
-    def path(self, uid: tuple[int, int]) -> bytes | str | None:
+    def path(self, uid: int | tuple[int, int]) -> bytes | str | None:
         """Returns path for id. None if id is unknown to this snapshot."""
-        return self._inode_to_path.get(uid)
+        if isinstance(uid, tuple):
+            paths = self._inode_to_paths.get(uid)
+        else:
+            paths = {
+                path
+                for path, stat_info in self._stat_info.items()
+                if stat_info.st_ino == uid
+            }
+        if not paths:
+            return None
+        return _sort_paths(paths)[0]
+
+    def paths_for_inode(self, uid: int | tuple[int, int]) -> set[bytes | str]:
+        """Returns all paths for an inode id."""
+        if isinstance(uid, tuple):
+            return set(self._inode_to_paths.get(uid, set()))
+        return {
+            path
+            for path, stat_info in self._stat_info.items()
+            if stat_info.st_ino == uid
+        }
 
     def inode(self, path: bytes | str) -> tuple[int, int]:
         """Returns an id for path."""
@@ -408,6 +489,7 @@ class EmptyDirectorySnapshot(DirectorySnapshot):
 
     def __init__(self) -> None:
         self._stat_info: dict[bytes | str, os.stat_result] = {}
+        self._inode_to_paths: dict[tuple[int, int], set[bytes | str]] = {}
 
     @staticmethod
     def path(_: Any) -> None:

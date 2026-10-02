@@ -4,12 +4,31 @@ import errno
 import os
 import pickle
 import time
+from itertools import permutations
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from watchdog.utils import platform
 from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff, EmptyDirectorySnapshot
 
 from .shell import mkdir, mv, rm, touch
+
+
+def make_snapshot(paths):
+    snapshot = DirectorySnapshot.__new__(DirectorySnapshot)
+    snapshot._stat_info = {}
+    snapshot._inode_to_paths = {}
+    for path, (inode, device) in paths.items():
+        stat = SimpleNamespace(
+            st_ino=inode,
+            st_dev=device,
+            st_mode=0o100000,
+            st_mtime=1,
+            st_size=1,
+        )
+        snapshot._stat_info[path] = stat
+        snapshot._inode_to_paths.setdefault((inode, device), set()).add(path)
+    return snapshot
 
 
 def wait():
@@ -200,6 +219,138 @@ def test_ignore_device(p):
         assert not len(diff_without_device)
         assert diff_without_device.files_deleted == []
         assert diff_without_device.files_created == []
+
+
+def test_link_aware_hardlinks_stable_with_shuffled_snapshots(p):
+    touch(p("a"))
+    os.link(p("a"), p("b"))
+    os.link(p("a"), p("c"))
+
+    def listdir_in_order(order):
+        def listdir(path):
+            if path != p(""):
+                yield from os.scandir(path)
+                return
+
+            entries = list(os.scandir(path))
+            entries.sort(key=lambda entry: order.index(entry.name) if entry.name in order else len(order))
+            yield from entries
+
+        return listdir
+
+    expected = None
+    names = ("a", "b", "c")
+    for ref_order in permutations(names):
+        ref = DirectorySnapshot(p(""), listdir=listdir_in_order(ref_order))
+
+        rm(p("c"))
+        mv(p("b"), p("d"))
+
+        try:
+            for snapshot_order in permutations(("a", "c", "d")):
+                snapshot = DirectorySnapshot(p(""), listdir=listdir_in_order(snapshot_order))
+                diff = DirectorySnapshotDiff(ref, snapshot, link_aware=True)
+                result = (
+                    diff.files_created,
+                    diff.files_deleted,
+                    diff.files_modified,
+                    diff.files_moved,
+                )
+                if expected is None:
+                    expected = result
+                else:
+                    assert result == expected
+        finally:
+            mv(p("d"), p("b"))
+            os.link(p("a"), p("c"))
+
+    assert expected == (
+        [p("d")],
+        [p("b"), p("c")],
+        [],
+        [],
+    )
+
+
+def test_link_aware_stable_move_pairing():
+    ref = make_snapshot({"/a": (1, 1), "/b": (1, 1), "/c": (1, 1)})
+    snapshot = make_snapshot({"/d": (1, 1), "/e": (1, 1), "/f": (1, 1)})
+
+    diff = DirectorySnapshotDiff(ref, snapshot, link_aware=True)
+
+    assert diff.files_moved == [("/a", "/d"), ("/b", "/e"), ("/c", "/f")]
+    assert diff.files_created == []
+    assert diff.files_deleted == []
+
+
+def test_link_aware_reports_link_create_and_delete_when_move_is_ambiguous():
+    ref = make_snapshot({"/a": (1, 1), "/b": (1, 1), "/c": (1, 1)})
+    snapshot = make_snapshot({"/a": (1, 1), "/d": (1, 1)})
+
+    diff = DirectorySnapshotDiff(ref, snapshot, link_aware=True)
+
+    assert diff.files_created == ["/d"]
+    assert diff.files_deleted == ["/b", "/c"]
+    assert diff.files_moved == []
+
+
+def test_link_aware_does_not_match_inodes_on_different_devices():
+    ref = make_snapshot({"/a": (1, 1)})
+    snapshot = make_snapshot({"/b": (1, 2)})
+
+    diff = DirectorySnapshotDiff(ref, snapshot, link_aware=True)
+    assert diff.files_created == ["/b"]
+    assert diff.files_deleted == ["/a"]
+    assert diff.files_moved == []
+
+    diff_ignore_device = DirectorySnapshotDiff(ref, snapshot, link_aware=True, ignore_device=True)
+    assert diff_ignore_device.files_moved == [("/a", "/b")]
+
+
+def test_ignore_device_matches_moved_inodes():
+    ref = make_snapshot({"/a": (1, 1)})
+    snapshot = make_snapshot({"/b": (1, 2)})
+
+    diff = DirectorySnapshotDiff(ref, snapshot, ignore_device=True)
+
+    assert diff.files_moved == [("/a", "/b")]
+    assert diff.files_created == []
+    assert diff.files_deleted == []
+
+
+def test_link_aware_content_changes_apply_to_remaining_paths(p):
+    touch(p("a"))
+    os.link(p("a"), p("b"))
+    ref = DirectorySnapshot(p(""))
+    wait()
+
+    with open(p("a"), "w", encoding="utf-8") as file:
+        file.write("changed")
+    mv(p("a"), p("c"))
+
+    diff = DirectorySnapshotDiff(ref, DirectorySnapshot(p("")), link_aware=True)
+
+    assert diff.files_moved == [(p("a"), p("c"))]
+    assert diff.files_modified == [p("b"), p("c")]
+    assert diff.files_created == []
+    assert diff.files_deleted == []
+
+
+def test_link_aware_content_changes_apply_to_all_links(p):
+    touch(p("a"))
+    os.link(p("a"), p("b"))
+    ref = DirectorySnapshot(p(""))
+    wait()
+
+    with open(p("a"), "w", encoding="utf-8") as file:
+        file.write("changed")
+
+    diff = DirectorySnapshotDiff(ref, DirectorySnapshot(p("")), link_aware=True)
+
+    assert diff.files_modified == [p("a"), p("b")]
+    assert diff.files_created == []
+    assert diff.files_deleted == []
+    assert diff.files_moved == []
 
 
 def test_empty_snapshot(p):
