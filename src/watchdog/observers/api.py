@@ -269,6 +269,8 @@ class BaseObserver(EventDispatcher):
         self._handlers: defaultdict[ObservedWatch, set[FileSystemEventHandler]] = defaultdict(set)
         self._emitters: set[EventEmitter] = set()
         self._emitter_for_watch: dict[ObservedWatch, EventEmitter] = {}
+        self._move_event_groups: set[object] = set()
+        self.supports_move_event_groups = False
 
     def _add_emitter(self, emitter: EventEmitter) -> None:
         self._emitter_for_watch[emitter.watch] = emitter
@@ -335,6 +337,7 @@ class BaseObserver(EventDispatcher):
         recursive: bool = False,
         event_filter: list[type[FileSystemEvent]] | None = None,
         follow_symlink: bool = False,
+        move_event_group: object | None = None,
     ) -> ObservedWatch:
         """Schedules watching a path and calls appropriate methods specified
         in the given event handler in response to file system events.
@@ -366,13 +369,20 @@ class BaseObserver(EventDispatcher):
             An :class:`ObservedWatch` object instance representing
             a watch.
         """
+        if move_event_group is not None and not self.supports_move_event_groups:
+            raise NotImplementedError("Explicit move event groups are only supported by the Linux inotify observer")
+
         with self._lock:
             watch = ObservedWatch(path, recursive=recursive, event_filter=event_filter, follow_symlink=follow_symlink)
             self._add_handler_for_watch(event_handler, watch)
 
             # If we don't have an emitter for this watch already, create it.
             if watch not in self._emitter_for_watch:
-                emitter = self._emitter_class(self.event_queue, watch, timeout=self.timeout, event_filter=event_filter)
+                emitter_kwargs = {"timeout": self.timeout, "event_filter": event_filter}
+                if move_event_group is not None:
+                    emitter_kwargs["move_event_group"] = move_event_group
+                    self._move_event_groups.add(move_event_group)
+                emitter = self._emitter_class(self.event_queue, watch, **emitter_kwargs)
                 if self.is_alive():
                     emitter.start()
                 self._add_emitter(emitter)

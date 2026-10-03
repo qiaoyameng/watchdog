@@ -333,11 +333,14 @@ class FSEventsObserver(BaseObserver):
         recursive: bool = False,
         follow_symlink: bool = False,
         event_filter: list[type[FileSystemEvent]] | None = None,
+        move_event_group: object | None = None,
     ) -> ObservedWatch:
         # Fix for issue #26: Trace/BPT error when given a unicode path
         # string. https://github.com/gorakhargosh/watchdog/issues#issue/26
         if isinstance(path, str):
             path = unicodedata.normalize("NFC", path)
+        if move_event_group is not None:
+            raise NotImplementedError("Explicit move event groups are only supported by the Linux inotify observer")
 
         return super().schedule(
             event_handler, path, recursive=recursive, follow_symlink=follow_symlink, event_filter=event_filter

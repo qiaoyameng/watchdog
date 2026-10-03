@@ -167,6 +167,9 @@ class WatchCallback(Protocol):
     def on_watch_deleted(self, wd: WatchDescriptor) -> None:
         """Called when a watch that this callback is registered at is removed.
         This is the case when the watched object is deleted."""
+
+    def on_queue_overflow(self, source_generation: int) -> None:
+        """Called when this inotify instance drops events because its queue overflowed."""
         ...
 
 
@@ -217,6 +220,7 @@ class InotifyFD(BaseThread):
     # InotifyFD is a singleton for now.
     _instance: ClassVar[InotifyFD | None] = None
     _global_lock: ClassVar[threading.Lock] = threading.Lock()
+    _next_generation: ClassVar[int] = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -242,6 +246,9 @@ class InotifyFD(BaseThread):
 
         # Stores the callbacks for a given watch descriptor.
         self._watch_for_wd: dict[WatchDescriptor, Watch] = {}
+        self._overflow_callbacks: dict[CallbackId, WatchCallback] = {}
+        self._generation = type(self)._next_generation
+        type(self)._next_generation += 1
 
     @classmethod
     def _create_inotify_fd(cls) -> int:
@@ -259,6 +266,24 @@ class InotifyFD(BaseThread):
                 cls._instance = InotifyFD()
                 cls._instance.start()
             return cls._instance
+
+    @property
+    def generation(self) -> int:
+        """Monotonic generation of this inotify instance.
+
+        Move cookies are only meaningful within one generation.
+        """
+        return self._generation
+
+    def add_overflow_callback(self, callback: WatchCallback, id_: CallbackId) -> None:
+        """Register a callback for IN_Q_OVERFLOW events on this instance."""
+        with self._lock:
+            self._overflow_callbacks[id_] = callback
+
+    def remove_overflow_callback(self, id_: CallbackId) -> None:
+        """Remove an IN_Q_OVERFLOW callback."""
+        with self._lock:
+            self._overflow_callbacks.pop(id_, None)
 
     def add_callback(self, path: bytes, mask: Mask, callback: WatchCallback, id_: CallbackId) -> WatchDescriptor:
         """Adds a callback for the given path to monitor events specified by the
@@ -333,10 +358,14 @@ class InotifyFD(BaseThread):
 
     def handle_event(self, event: InotifyEvent) -> None:
         with self._lock:
+            overflow_callbacks = ()
+            if event.wd == WatchDescriptor(-1):
+                overflow_callbacks: Sequence[WatchCallback] = list(self._overflow_callbacks.values())
+                return
             if event.is_ignored:
                 # Clean up book-keeping for deleted watches.
                 delete_callbacks: Sequence[WatchCallback] = self._remove_watch(event.wd)
-                callbacks: Sequence[WatchCallback] = ()
+                callbacks = ()
             else:
                 delete_callbacks = ()
                 watch = self._watch_for_wd.get(event.wd)
@@ -350,6 +379,8 @@ class InotifyFD(BaseThread):
             callback.on_event(event)
         for callback in delete_callbacks:
             callback.on_watch_deleted(event.wd)
+        for callback in overflow_callbacks:
+            callback.on_queue_overflow(self._generation)
 
     def read_events(self, *, event_buffer_size: int = DEFAULT_EVENT_BUFFER_SIZE) -> list[InotifyEvent]:
         """
@@ -358,9 +389,8 @@ class InotifyFD(BaseThread):
         """
         event_buffer = self._read_event_buffer(event_buffer_size)
         return [
-            InotifyEvent(wd, mask, cookie, name)
+            InotifyEvent(wd, mask, cookie, name, self.generation)
             for wd, mask, cookie, name in InotifyFD._parse_event_buffer(event_buffer)
-            if wd != -1
         ]
 
     # Non-synchronized methods.
@@ -445,13 +475,15 @@ class InotifyFD(BaseThread):
             Event bit mask.
         """
         # returns an existing watch descriptor, if one already exists for path:
-        wd = inotify_add_watch(self._inotify_fd, path, mask)
+        wd = inotify_add_watch(self._inotify_fd, path, Mask(mask | InotifyConstants.IN_MASK_ADD))
         if wd == -1:
             InotifyFD._raise_error()
         watch = self._watch_for_wd.get(wd)
         if watch is None:
             watch = Watch(wd, mask, path)
             self._watch_for_wd[wd] = watch
+        else:
+            watch.mask = Mask(watch.mask | mask)
         return watch
 
     def _remove_callback(self, wd: WatchDescriptor, id_: CallbackId) -> None:
@@ -546,6 +578,8 @@ class InotifyEvent:
     """Event cookie"""
     name: bytes
     """Base name of the event source path. might be empty"""
+    source_generation: int = 0
+    """Inotify FD generation that emitted this event."""
     # src_path: bytes; We cannot set the src_path.
     # See 'Challenges With inotify' section in the description of inotify.py
 

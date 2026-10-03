@@ -103,6 +103,7 @@ from watchdog.observers.inotify_c import (
     WatchDescriptor,
 )
 from watchdog.observers.inotify_move_event_grouper import (
+    ExplainedInotifyEvent,
     GroupedInotifyEvent,
     InotifyMoveEventGrouper,
     PathedInotifyEvent,
@@ -150,8 +151,9 @@ class InotifyWatchGroup(WatchCallback):
     """The event mask for this inotify instance."""
     follow_symlink: bool = False
 
-    _move_event_grouper: InotifyMoveEventGrouper = field(default_factory=InotifyMoveEventGrouper, init=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    move_event_grouper: InotifyMoveEventGrouper | None = None
+    _move_event_grouper: InotifyMoveEventGrouper = field(init=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
     _id: CallbackId = field(init=False)
 
     _is_active: bool = field(default=False, init=False)
@@ -162,10 +164,20 @@ class InotifyWatchGroup(WatchCallback):
     def __post_init__(self) -> None:
         self.event_mask = InotifyWatchGroup.build_event_mask(self.event_mask, follow_symlink=self.follow_symlink)
         self._id = CallbackId(id(self))
+        self._move_event_grouper = (
+            self.move_event_grouper
+            if self.move_event_grouper is not None
+            else InotifyMoveEventGrouper(close_when_empty=True)
+        )
         self._activate()
+        if self._active_callbacks_by_watch:
+            self._inotify_fd.add_overflow_callback(self._callback, self._id)
+            self._move_event_grouper.register_member(self)
 
     @staticmethod
     def build_event_mask(event_mask: Mask, *, follow_symlink: bool) -> Mask:
+        if event_mask == 0:
+            event_mask = WATCHDOG_ALL_EVENTS
         if follow_symlink:
             event_mask = Mask(event_mask & ~InotifyConstants.IN_DONT_FOLLOW)
         else:
@@ -177,16 +189,9 @@ class InotifyWatchGroup(WatchCallback):
         """Returns True if there are any callbacks active"""
         return self._is_active
 
-    def _source_for_move(self, cookie: int) -> bytes | None:
-        """The source path corresponding to the given MOVED_TO event.
-
-        If the source path is outside the monitored directories, None
-        is returned instead.
-        """
-        src_event = self._move_event_grouper.get_queued_moved_from_event(cookie)
-        if src_event is not None:
-            return src_event.path
-        return None
+    @property
+    def move_event_group(self) -> InotifyMoveEventGrouper:
+        return self._move_event_grouper
 
     @property
     def _callback(self) -> WatchCallback:
@@ -197,7 +202,7 @@ class InotifyWatchGroup(WatchCallback):
         paired move event. If this buffer has been closed, raise the Closed
         exception.
         """
-        return self._move_event_grouper.read_event()
+        return self._move_event_grouper.read_event(self._id)
 
     def on_watch_deleted(self, wd: WatchDescriptor) -> None:
         """Called when a watch that this callback is registered at is removed.
@@ -205,7 +210,32 @@ class InotifyWatchGroup(WatchCallback):
         with self._lock:
             if not self.is_active:
                 return
+            self._move_event_grouper.cancel_watch(self._id, wd)
             self._remove_watch_internally(wd)
+
+    def on_queue_overflow(self, source_generation: int) -> None:
+        with self._lock:
+            if not self.is_active or source_generation != self._inotify_fd.generation:
+                return
+            self._move_event_grouper.queue_overflow(source_generation)
+
+    def on_paired_move(
+        self,
+        source: PathedInotifyEvent,
+        destination: PathedInotifyEvent,
+        *,
+        is_source: bool,
+        is_destination: bool,
+    ) -> None:
+        with self._lock:
+            if not self.is_active:
+                return
+            if is_source and is_destination:
+                self._move_watches(source.path, destination.path)
+            elif is_destination and source.ev.is_directory:
+                self._adopt_moved_tree(source.path, destination.path)
+            elif is_source and source.ev.is_directory:
+                self._detach_moved_tree(source.path)
 
     def on_event(self, event: InotifyEvent) -> None:
         """called for every event for each watch this callback is registered at."""
@@ -216,43 +246,34 @@ class InotifyWatchGroup(WatchCallback):
             if src_path is None:
                 return
 
+            pathed_event = PathedInotifyEvent(event, src_path, event.source_generation)
+
             # todo look into desired behavior for IN_MOVE_SELF events
             #  (keep watching?, stop watching?, are they even possible?)
             if event.is_moved_from:
-                # TODO: When a directory from a watched directory
-                #  is moved into another part of the filesystem, this
-                #  will not generate DELETE events for the directory tree.
-                #  We need to coalesce IN_MOVED_FROM events and those
-                #  IN_MOVED_FROM events which don't pair up with
-                #  IN_MOVED_TO events should be marked IN_DELETE (maybe?)
-                #  instead relative to this directory. And the respective
-                #  callbacks for the directory and sub directory must be removed.
-                #
-                #  also: hold back all other events for this directory and its
-                #  subdirectories, until we know whether it is still watched
+                # The shared grouper either authenticates the matching MOVED_TO
+                # or releases this half with an explicit pairing reason.
                 pass
             elif event.is_moved_to:
-                move_src_path = self._source_for_move(event.cookie)
-                move_dst_path = src_path
-                if move_src_path is not None:
-                    self._move_watches(move_src_path, move_dst_path)
-                # TODO: When a directory from another part of the
-                #  filesystem is moved into a watched directory, this
-                #  will not generate events for the directory tree.
-                #  We need to coalesce IN_MOVED_TO events and those
-                #  IN_MOVED_TO events which don't pair up with
-                #  IN_MOVED_FROM events should be marked IN_CREATE
-                #  instead relative to this directory.
+                # A directory entering this group from another member is
+                # adopted through on_paired_move(). If the source is not a
+                # group member, the pairing timeout produces create events.
+                pass
             elif event.is_create and event.is_directory and self.is_recursive:
                 self._add_all_callbacks(src_path)
 
-            self._move_event_grouper.put_event(PathedInotifyEvent(event, src_path))
+            self._move_event_grouper.put_event(pathed_event, self._id, source_generation=event.source_generation)
 
             if event.is_create and event.is_directory and self.is_recursive:
                 for sub_event in self._recursive_simulate(src_path):
                     sub_src_path = self._build_event_source_path(sub_event)
                     if sub_src_path is not None:
-                        self._move_event_grouper.put_event(PathedInotifyEvent(sub_event, sub_src_path))
+                        sub_pathed_event = PathedInotifyEvent(sub_event, sub_src_path, sub_event.source_generation)
+                        self._move_event_grouper.put_event(
+                            sub_pathed_event,
+                            self._id,
+                            source_generation=sub_event.source_generation,
+                        )
 
     def _recursive_simulate(self, src_path: bytes) -> list[InotifyEvent]:
         # HACK: We need to traverse the directory path recursively and simulate
@@ -264,21 +285,22 @@ class InotifyWatchGroup(WatchCallback):
                 full_path = os.path.join(root, dirname)
                 wd_dir = self._active_callbacks_by_path[os.path.dirname(full_path)]
                 mask = Mask(InotifyConstants.IN_CREATE | InotifyConstants.IN_ISDIR)
-                events.append(InotifyEvent(wd_dir, mask, 0, dirname))
+                events.append(InotifyEvent(wd_dir, mask, 0, dirname, self._inotify_fd.generation))
 
             for filename in filenames:
                 full_path = os.path.join(root, filename)
                 wd_parent_dir = self._active_callbacks_by_path[os.path.dirname(full_path)]
                 mask = InotifyConstants.IN_CREATE
-                events.append(InotifyEvent(wd_parent_dir, mask, 0, filename))
+                events.append(InotifyEvent(wd_parent_dir, mask, 0, filename, self._inotify_fd.generation))
         return events
 
     def deactivate(self) -> None:
         """Removes all associated watches."""
         with self._lock:
             self._is_active = False
+            self._inotify_fd.remove_overflow_callback(self._id)
             self._remove_callbacks(list(self._active_callbacks_by_watch))
-            self._move_event_grouper.close()
+        self._move_event_grouper.unregister_member(self._id)
 
     def _activate(self) -> None:
         """Adds a watch (optionally recursively) for the given directory path
@@ -289,7 +311,8 @@ class InotifyWatchGroup(WatchCallback):
                 return
 
             self._add_all_callbacks(self.path)
-            self._is_active = True
+            if self._active_callbacks_by_watch:
+                self._is_active = True
 
     # Non-synchronized methods:
 
@@ -316,6 +339,24 @@ class InotifyWatchGroup(WatchCallback):
                     self._active_callbacks_by_watch[wd] = path
                     self._active_callbacks_by_path[path] = wd
 
+    def _adopt_moved_tree(self, move_src_path: bytes, move_dst_path: bytes) -> None:
+        """Attach watches from another group member to this destination."""
+        self._add_callback(move_dst_path)
+        if self.is_recursive:
+            self._add_descendant_callbacks(move_dst_path)
+
+    def _detach_moved_tree(self, move_src_path: bytes) -> None:
+        """Release this member's watches for a tree moved to another member."""
+        wds: list[WatchDescriptor] = []
+        moved_wd = self._active_callbacks_by_path.get(move_src_path)
+        if moved_wd is not None:
+            wds.append(moved_wd)
+
+        move_src_prefix = move_src_path + os.path.sep.encode()
+        wds.extend(wd for path, wd in self._active_callbacks_by_path.items() if path.startswith(move_src_prefix))
+        if wds:
+            self._remove_callbacks(wds)
+
     def _add_all_callbacks(self, path: bytes) -> None:
         """Adds a watch (optionally recursively) for the given directory path
         to monitor events specified by the mask.
@@ -326,12 +367,15 @@ class InotifyWatchGroup(WatchCallback):
         is_dir = os.path.isdir(path)
         self._add_callback(path)
         if is_dir and self.is_recursive:
-            for root, dirnames, _ in os.walk(path, followlinks=self.follow_symlink):
-                for dirname in dirnames:
-                    full_path = os.path.join(root, dirname)
-                    if not self.follow_symlink and os.path.islink(full_path):
-                        continue
-                    self._add_callback(full_path)
+            self._add_descendant_callbacks(path)
+
+    def _add_descendant_callbacks(self, path: bytes) -> None:
+        for root, dirnames, _ in os.walk(path, followlinks=self.follow_symlink):
+            for dirname in dirnames:
+                full_path = os.path.join(root, dirname)
+                if not self.follow_symlink and os.path.islink(full_path):
+                    continue
+                self._add_callback(full_path)
 
     def _add_callback(self, path: bytes) -> None:
         """Adds a callback for the given path to monitor events specified by the
@@ -357,12 +401,15 @@ class InotifyWatchGroup(WatchCallback):
 
     def _remove_watch_internally(self, wd: WatchDescriptor) -> None:
         """Removes a watch descriptor from internal dicts."""
-        path = self._active_callbacks_by_watch.pop(wd)
-        wd2 = self._active_callbacks_by_path.pop(path)
+        path = self._active_callbacks_by_watch.pop(wd, None)
+        if path is None:
+            return
+        wd2 = self._active_callbacks_by_path.pop(path, None)
         if wd2 != wd:
             # Oops. The path already belongs to a different wd. Put it back.
             # This can happen, when events are sent slightly out of order.
-            self._active_callbacks_by_path[path] = wd2
+            if wd2 is not None:
+                self._active_callbacks_by_path[path] = wd2
 
 
 def _select_event_type(
@@ -402,10 +449,12 @@ class InotifyEmitter(EventEmitter):
         timeout: float = DEFAULT_EMITTER_TIMEOUT,
         event_filter: list[type[FileSystemEvent]] | None = None,
         inotify_fd: InotifyFD | None = None,
+        move_event_group: InotifyMoveEventGrouper | None = None,
     ) -> None:
         super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
         self._lock: threading.Lock = threading.Lock()
         self._inotify_fd: InotifyFD = inotify_fd if inotify_fd is not None else InotifyFD.get_instance()
+        self._move_event_group = move_event_group
         self._inotify: InotifyWatchGroup | None = None
 
     def on_thread_start(self) -> None:
@@ -417,6 +466,7 @@ class InotifyEmitter(EventEmitter):
             is_recursive=self.watch.is_recursive,
             event_mask=event_mask,
             follow_symlink=self.watch.follow_symlink,
+            move_event_grouper=self._move_event_group,
         )
 
     def on_thread_stop(self) -> None:
@@ -442,6 +492,37 @@ class InotifyEmitter(EventEmitter):
     def build_and_queue_event(self, event: GroupedInotifyEvent, *, full_events: bool = False) -> None:
         """called for every event for each watch this callback is registered at."""
         cls: FileSystemEventCtor
+        if isinstance(event, ExplainedInotifyEvent):
+            if event.event is None:
+                logger.warning("inotify queue overflow; some filesystem events may have been lost")
+                return
+            explained_event = event.event
+            src_path = self._decode_path(explained_event.path)
+            if explained_event.ev.is_moved_to:
+                cls = (
+                    _select_event_type(DirMovedEvent, FileMovedEvent, is_directory=explained_event.ev.is_directory)
+                    if full_events
+                    else _select_event_type(
+                        DirCreatedEvent,
+                        FileCreatedEvent,
+                        is_directory=explained_event.ev.is_directory,
+                    )
+                )
+                self.queue_event(cls("", src_path) if full_events else cls(src_path))
+                self.queue_event(DirModifiedEvent(os.path.dirname(src_path)))
+            else:
+                cls = (
+                    _select_event_type(DirMovedEvent, FileMovedEvent, is_directory=explained_event.ev.is_directory)
+                    if full_events
+                    else _select_event_type(
+                        DirDeletedEvent,
+                        FileDeletedEvent,
+                        is_directory=explained_event.ev.is_directory,
+                    )
+                )
+                self.queue_event(cls(src_path, "") if full_events else cls(src_path))
+                self.queue_event(DirModifiedEvent(os.path.dirname(src_path)))
+            return
         if not isinstance(event, PathedInotifyEvent):
             # we got a move event tuple
             move_from, move_to = event
@@ -554,3 +635,4 @@ class InotifyObserver(BaseObserver):
     def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, generate_full_events: bool = False) -> None:
         cls = InotifyFullEmitter if generate_full_events else InotifyEmitter
         super().__init__(cls, timeout=timeout)
+        self.supports_move_event_groups = True

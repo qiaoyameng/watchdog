@@ -14,7 +14,14 @@ import random
 
 from watchdog.observers.inotify import InotifyWatchGroup
 from watchdog.observers.inotify_c import WATCHDOG_ALL_EVENTS, InotifyConstants, InotifyFD, Mask
-from watchdog.observers.inotify_move_event_grouper import GroupedInotifyEvent, PathedInotifyEvent
+from watchdog.observers.inotify_move_event_grouper import (
+    ExplainedInotifyEvent,
+    GroupedInotifyEvent,
+    InotifyMoveEventGroup,
+    InotifyMoveEventGrouper,
+    MovePairReason,
+    PathedInotifyEvent,
+)
 
 from .shell import mkdir, mount_tmpfs, mv, rm, symlink, touch, unmount
 
@@ -26,13 +33,20 @@ def wait_for_move_event(read_event: Callable[[], GroupedInotifyEvent]) -> Groupe
             return event
 
 
-def create_inotify_watch(path: bytes, *, recursive: bool = False, follow_symlink: bool = False) -> InotifyWatchGroup:
+def create_inotify_watch(
+    path: bytes,
+    *,
+    recursive: bool = False,
+    follow_symlink: bool = False,
+    move_event_grouper: InotifyMoveEventGroup | None = None,
+) -> InotifyWatchGroup:
     return InotifyWatchGroup(
         InotifyFD.get_instance(),
         path,
         is_recursive=recursive,
         follow_symlink=follow_symlink,
         event_mask=WATCHDOG_ALL_EVENTS,
+        move_event_grouper=move_event_grouper,
     )
 
 
@@ -186,6 +200,9 @@ def test_unmount_watched_directory_filesystem(p):
 
 def assert_event(inotify: InotifyWatchGroup, expected_path: str, expected_kind: Mask):
     event = inotify.read_event()
+    if isinstance(event, ExplainedInotifyEvent):
+        assert event.event is not None
+        event = event.event
     assert event.path == expected_path.encode()
     assert event.ev.mask & expected_kind
 
@@ -246,3 +263,130 @@ def test_watch_groups_are_independent(p):
     inotify_root.deactivate()
     inotify_a.deactivate()
     cleanup()
+
+
+@pytest.mark.timeout(10)
+def test_explicit_group_pairs_real_move_across_roots(p):
+    mkdir(p("source_root"))
+    mkdir(p("destination_root"))
+    mkdir(p("source_root", "tree"))
+    mkdir(p("source_root", "tree", "child"))
+    touch(p("source_root", "tree", "child", "a"))
+
+    move_group = InotifyMoveEventGroup(delay=0.2)
+    source = create_inotify_watch(p("source_root").encode(), recursive=True, move_event_grouper=move_group)
+    destination = create_inotify_watch(
+        p("destination_root").encode(),
+        recursive=True,
+        move_event_grouper=move_group,
+    )
+
+    try:
+        mv(p("source_root", "tree"), p("destination_root", "tree"))
+
+        source_event = wait_for_move_event(source.read_event)
+        destination_event = wait_for_move_event(destination.read_event)
+        assert source_event == destination_event
+        frm, to = source_event
+        assert frm.path == p("source_root", "tree").encode()
+        assert to.path == p("destination_root", "tree").encode()
+
+        touch(p("destination_root", "tree", "child", "b"))
+        event = destination.read_event()
+        found_paths = []
+        for _ in range(8):
+            if isinstance(event, PathedInotifyEvent):
+                found_paths.append(event.path)
+                if event.path.endswith(b"/b"):
+                    break
+            event = destination.read_event()
+        assert any(path.endswith(b"/b") for path in found_paths)
+    finally:
+        destination.deactivate()
+        source.deactivate()
+        move_group.close()
+
+
+@pytest.mark.timeout(10)
+def test_observer_schedule_group_pairs_move_across_roots(p):
+    from queue import Queue
+
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers.inotify import InotifyObserver
+
+    class Recorder(FileSystemEventHandler):
+        def __init__(self) -> None:
+            self.events: Queue = Queue()
+
+        def on_moved(self, event):
+            self.events.put(event)
+
+    mkdir(p("source_root"))
+    mkdir(p("destination_root"))
+    touch(p("source_root", "a"))
+
+    group = InotifyMoveEventGroup(delay=0.2)
+    source_handler = Recorder()
+    destination_handler = Recorder()
+    observer = InotifyObserver()
+    observer.start()
+    source_watch = observer.schedule(source_handler, p("source_root"), move_event_group=group)
+    destination_watch = observer.schedule(destination_handler, p("destination_root"), move_event_group=group)
+
+    try:
+        mv(p("source_root", "a"), p("destination_root", "b"))
+        source_event = source_handler.events.get(timeout=5)
+        destination_event = destination_handler.events.get(timeout=5)
+        assert source_event == destination_event
+        assert source_event.src_path == p("source_root", "a")
+        assert source_event.dest_path == p("destination_root", "b")
+    finally:
+        observer.unschedule(destination_watch)
+        observer.unschedule(source_watch)
+        observer.stop()
+        observer.join()
+        group.close()
+
+
+@pytest.mark.timeout(10)
+def test_explicit_group_degrades_when_source_is_not_a_member(p):
+    mkdir(p("outside"))
+    mkdir(p("destination_root"))
+    touch(p("outside", "a"))
+
+    group = InotifyMoveEventGroup(delay=0.05)
+    destination = create_inotify_watch(p("destination_root").encode(), move_event_grouper=group)
+
+    try:
+        mv(p("outside", "a"), p("destination_root", "b"))
+        event = destination.read_event()
+        assert isinstance(event, ExplainedInotifyEvent)
+        assert event.reason is MovePairReason.PAIRING_TIMEOUT
+        assert event.event is not None
+        assert event.event.path == p("destination_root", "b").encode()
+    finally:
+        destination.deactivate()
+        group.close()
+
+
+@pytest.mark.timeout(10)
+def test_pending_move_is_cancelled_when_watch_removed(p):
+    mkdir(p("dir"))
+    touch(p("dir", "a"))
+
+    group = InotifyMoveEventGroup(delay=1)
+    watch_group = create_inotify_watch(p("dir").encode(), move_event_grouper=group)
+    try:
+        mv(p("dir", "a"), p("gone"))
+        rm(p("dir"), recursive=True)
+        reasons = []
+        while True:
+            event = watch_group.read_event()
+            if isinstance(event, ExplainedInotifyEvent):
+                reasons.append(event.reason)
+                if event.reason is MovePairReason.WATCH_REMOVED:
+                    break
+        assert reasons.count(MovePairReason.WATCH_REMOVED) == 1
+    finally:
+        watch_group.deactivate()
+        group.close()
