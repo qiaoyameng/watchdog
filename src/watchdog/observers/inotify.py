@@ -73,6 +73,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Protocol, cast
 
 from watchdog.events import (
@@ -105,6 +106,7 @@ from watchdog.observers.inotify_c import (
 from watchdog.observers.inotify_move_event_grouper import (
     GroupedInotifyEvent,
     InotifyMoveEventGrouper,
+    InotifyPairingGroup,
     PathedInotifyEvent,
 )
 
@@ -138,6 +140,12 @@ class InotifyWatchGroup(WatchCallback):
         :class:`bytes`
     :param is_recursive:
         ``True`` if subdirectories should be monitored; ``False`` otherwise.
+    :param pairing_group:
+        An optional :class:`InotifyPairingGroup` shared with other
+        ``InotifyWatchGroup`` instances (e.g. one per monitored root
+        directory). Within the group, IN_MOVED_FROM and IN_MOVED_TO events
+        are paired across members, so a file moved from one watched root
+        into another is reported as a single move to both ends.
     """
 
     _inotify_fd: InotifyFD
@@ -149,6 +157,8 @@ class InotifyWatchGroup(WatchCallback):
     is_recursive: bool = False
     """The event mask for this inotify instance."""
     follow_symlink: bool = False
+    pairing_group: InotifyPairingGroup | None = None
+    """The optional group of watch groups sharing one pairable event source."""
 
     _move_event_grouper: InotifyMoveEventGrouper = field(default_factory=InotifyMoveEventGrouper, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
@@ -206,6 +216,8 @@ class InotifyWatchGroup(WatchCallback):
             if not self.is_active:
                 return
             self._remove_watch_internally(wd)
+            if self.pairing_group is not None:
+                self.pairing_group.cancel_pending(self, wd)
 
     def on_event(self, event: InotifyEvent) -> None:
         """called for every event for each watch this callback is registered at."""
@@ -215,10 +227,16 @@ class InotifyWatchGroup(WatchCallback):
             src_path = self._build_event_source_path(event)
             if src_path is None:
                 return
+            pathed_event = PathedInotifyEvent(event, src_path)
 
             # todo look into desired behavior for IN_MOVE_SELF events
             #  (keep watching?, stop watching?, are they even possible?)
             if event.is_moved_from:
+                if self.pairing_group is not None:
+                    # Register for cross-group pairing; the event itself is
+                    # queued (delayed) below and released unpaired if no
+                    # IN_MOVED_TO pairs with it in time.
+                    self.pairing_group.put_moved_from(self, pathed_event, self._inotify_fd.generation)
                 # TODO: When a directory from a watched directory
                 #  is moved into another part of the filesystem, this
                 #  will not generate DELETE events for the directory tree.
@@ -232,6 +250,9 @@ class InotifyWatchGroup(WatchCallback):
                 #  subdirectories, until we know whether it is still watched
                 pass
             elif event.is_moved_to:
+                if self.pairing_group is not None:
+                    self._dispatch_grouped_moved_to(pathed_event)
+                    return
                 move_src_path = self._source_for_move(event.cookie)
                 move_dst_path = src_path
                 if move_src_path is not None:
@@ -246,13 +267,81 @@ class InotifyWatchGroup(WatchCallback):
             elif event.is_create and event.is_directory and self.is_recursive:
                 self._add_all_callbacks(src_path)
 
-            self._move_event_grouper.put_event(PathedInotifyEvent(event, src_path))
+            self._move_event_grouper.put_event(pathed_event)
 
             if event.is_create and event.is_directory and self.is_recursive:
                 for sub_event in self._recursive_simulate(src_path):
                     sub_src_path = self._build_event_source_path(sub_event)
                     if sub_src_path is not None:
                         self._move_event_grouper.put_event(PathedInotifyEvent(sub_event, sub_src_path))
+
+    def _dispatch_grouped_moved_to(self, to_event: PathedInotifyEvent) -> None:
+        """Handles an IN_MOVED_TO event in pairing group mode. Must be called
+        with `self._lock` held.
+        """
+        assert self.pairing_group is not None  # noqa: S101
+        entry = self.pairing_group.take_moved_from(self._inotify_fd.generation, to_event.ev.cookie)
+        if entry is not None and not entry.owner.consume_pending_moved_from(entry.event):
+            # Too late: the pending IN_MOVED_FROM was already released
+            # unpaired to its owner. Do not pair retroactively.
+            entry = None
+        if entry is None:
+            # One end of the move is not in the group (or the pairing
+            # expired, was cancelled or discarded): degrade to an unpaired
+            # event, which surfaces as a creation.
+            if to_event.ev.is_directory and self.is_recursive:
+                self._add_all_callbacks(to_event.path)
+            self._move_event_grouper.put_event(to_event)
+            return
+
+        owner = entry.owner
+        from_event = entry.event
+        paired_event = (from_event, to_event)
+        if owner is self:
+            # Internal move within one member: update the paths of the
+            # watches of the moved directory tree.
+            self._move_watches(from_event.path, to_event.path)
+            self.publish_grouped_event(paired_event)
+        else:
+            # Move across members (e.g. between two watched roots): hand the
+            # watches of a moved directory tree over to the target member and
+            # deliver the paired event to both ends exactly once.
+            if to_event.ev.is_directory:
+                if self.is_recursive:
+                    self._add_all_callbacks(to_event.path)
+                owner.detach_moved_subtree(from_event.path)
+            owner.publish_grouped_event(paired_event)
+            self.publish_grouped_event(paired_event)
+
+    def consume_pending_moved_from(self, event: PathedInotifyEvent) -> bool:
+        """Consumes a pending IN_MOVED_FROM event queued by this watch group,
+        returning False if it was already released (e.g. its delay expired).
+        Called by another member of the pairing group when the event gets
+        paired with an IN_MOVED_TO event.
+        """
+        return self._move_event_grouper.remove_pending(event) is not None
+
+    def publish_grouped_event(self, event: GroupedInotifyEvent) -> None:
+        """Publishes an already-paired move event to the readers of this
+        watch group. Called by another member of the pairing group.
+        """
+        self._move_event_grouper.put_grouped(event)
+
+    def detach_moved_subtree(self, root_path: bytes) -> None:
+        """Detaches all watches at or below ``root_path``. Called by another
+        member of the pairing group when the directory tree at ``root_path``
+        was moved out of the scope of this watch group.
+        """
+        with self._lock:
+            if not self.is_active:
+                return
+            root_prefix = root_path + os.path.sep.encode()
+            wds = [
+                wd
+                for path, wd in self._active_callbacks_by_path.items()
+                if path == root_path or path.startswith(root_prefix)
+            ]
+            self._remove_callbacks(wds)
 
     def _recursive_simulate(self, src_path: bytes) -> list[InotifyEvent]:
         # HACK: We need to traverse the directory path recursively and simulate
@@ -278,6 +367,9 @@ class InotifyWatchGroup(WatchCallback):
         with self._lock:
             self._is_active = False
             self._remove_callbacks(list(self._active_callbacks_by_watch))
+            if self.pairing_group is not None:
+                self.pairing_group.cancel_pending(self)
+                self._inotify_fd.unregister_pairing_group(self.pairing_group)
             self._move_event_grouper.close()
 
     def _activate(self) -> None:
@@ -289,6 +381,8 @@ class InotifyWatchGroup(WatchCallback):
                 return
 
             self._add_all_callbacks(self.path)
+            if self.pairing_group is not None:
+                self._inotify_fd.register_pairing_group(self.pairing_group)
             self._is_active = True
 
     # Non-synchronized methods:
@@ -357,12 +451,17 @@ class InotifyWatchGroup(WatchCallback):
 
     def _remove_watch_internally(self, wd: WatchDescriptor) -> None:
         """Removes a watch descriptor from internal dicts."""
-        path = self._active_callbacks_by_watch.pop(wd)
-        wd2 = self._active_callbacks_by_path.pop(path)
+        path = self._active_callbacks_by_watch.pop(wd, None)
+        if path is None:
+            # The watch was already removed (e.g. explicitly removed before
+            # the corresponding IN_IGNORED event was processed).
+            return
+        wd2 = self._active_callbacks_by_path.pop(path, None)
         if wd2 != wd:
             # Oops. The path already belongs to a different wd. Put it back.
             # This can happen, when events are sent slightly out of order.
-            self._active_callbacks_by_path[path] = wd2
+            if wd2 is not None:
+                self._active_callbacks_by_path[path] = wd2
 
 
 def _select_event_type(
@@ -392,6 +491,12 @@ class InotifyEmitter(EventEmitter):
         Collection of event types to emit, or None for no filtering (default).
     :type event_filter:
         Iterable[:class:`watchdog.events.FileSystemEvent`] | None
+    :param pairing_group:
+        An optional :class:`InotifyPairingGroup` shared with other emitters
+        (e.g. one per monitored root directory) to pair move events across
+        watched roots. Linux only.
+    :type pairing_group:
+        :class:`watchdog.observers.inotify_move_event_grouper.InotifyPairingGroup` | None
     """
 
     def __init__(
@@ -402,10 +507,12 @@ class InotifyEmitter(EventEmitter):
         timeout: float = DEFAULT_EMITTER_TIMEOUT,
         event_filter: list[type[FileSystemEvent]] | None = None,
         inotify_fd: InotifyFD | None = None,
+        pairing_group: InotifyPairingGroup | None = None,
     ) -> None:
         super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
         self._lock: threading.Lock = threading.Lock()
         self._inotify_fd: InotifyFD = inotify_fd if inotify_fd is not None else InotifyFD.get_instance()
+        self._pairing_group: InotifyPairingGroup | None = pairing_group
         self._inotify: InotifyWatchGroup | None = None
 
     def on_thread_start(self) -> None:
@@ -417,6 +524,7 @@ class InotifyEmitter(EventEmitter):
             is_recursive=self.watch.is_recursive,
             event_mask=event_mask,
             follow_symlink=self.watch.follow_symlink,
+            pairing_group=self._pairing_group,
         )
 
     def on_thread_stop(self) -> None:
@@ -549,8 +657,23 @@ class InotifyFullEmitter(InotifyEmitter):
 class InotifyObserver(BaseObserver):
     """Observer thread that schedules watching directories and dispatches
     calls to event handlers.
+
+    :param pairing_group:
+        An optional :class:`InotifyPairingGroup` shared by all emitters of
+        this observer, so that moving a file or directory from one scheduled
+        root into another is reported as a single move event to the handlers
+        of both watches. Linux only.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_OBSERVER_TIMEOUT, generate_full_events: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_OBSERVER_TIMEOUT,
+        generate_full_events: bool = False,
+        pairing_group: InotifyPairingGroup | None = None,
+    ) -> None:
         cls = InotifyFullEmitter if generate_full_events else InotifyEmitter
-        super().__init__(cls, timeout=timeout)
+        emitter_class: type[EventEmitter] = cls
+        if pairing_group is not None:
+            emitter_class = cast(type[EventEmitter], partial(cls, pairing_group=pairing_group))
+        super().__init__(emitter_class, timeout=timeout)

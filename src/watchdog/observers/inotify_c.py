@@ -19,6 +19,8 @@ from watchdog.utils import BaseThread, UnsupportedLibcError
 if TYPE_CHECKING:
     from collections.abc import Generator, Sequence
 
+    from watchdog.observers.inotify_move_event_grouper import InotifyPairingGroup
+
 logger = logging.getLogger(__name__)
 
 libc = ctypes.CDLL(None)
@@ -217,12 +219,20 @@ class InotifyFD(BaseThread):
     # InotifyFD is a singleton for now.
     _instance: ClassVar[InotifyFD | None] = None
     _global_lock: ClassVar[threading.Lock] = threading.Lock()
+    _generation_lock: ClassVar[threading.Lock] = threading.Lock()
+    _generation_counter: ClassVar[int] = 0
 
     def __init__(self) -> None:
         super().__init__()
         if hasattr(self, "is_initialized"):
             return  # do not initialize the singleton twice.
         self.is_initialized = True
+
+        # The generation of this inotify instance. It is bumped whenever the
+        # instance is recreated or its event queue overflows, so that move
+        # event cookies from a previous generation cannot be paired with
+        # events of the current one.
+        self.generation: int = self._next_generation()
 
         # The file descriptor associated with the inotify instance.
         self._inotify_fd: int = self._create_inotify_fd()
@@ -242,6 +252,32 @@ class InotifyFD(BaseThread):
 
         # Stores the callbacks for a given watch descriptor.
         self._watch_for_wd: dict[WatchDescriptor, Watch] = {}
+
+        # Pairing groups (with their reference count) that share this
+        # instance as their pairable event source.
+        self._pairing_groups: dict[InotifyPairingGroup, int] = {}
+
+    @classmethod
+    def _next_generation(cls) -> int:
+        with cls._generation_lock:
+            cls._generation_counter += 1
+            return cls._generation_counter
+
+    def register_pairing_group(self, group: InotifyPairingGroup) -> None:
+        """Registers an InotifyPairingGroup that pairs move events of this
+        inotify instance, so it can be notified of queue overflows.
+        """
+        with self._lock:
+            self._pairing_groups[group] = self._pairing_groups.get(group, 0) + 1
+
+    def unregister_pairing_group(self, group: InotifyPairingGroup) -> None:
+        """Undoes one register_pairing_group() call for the given group."""
+        with self._lock:
+            count = self._pairing_groups.get(group, 0)
+            if count <= 1:
+                self._pairing_groups.pop(group, None)
+            else:
+                self._pairing_groups[group] = count - 1
 
     @classmethod
     def _create_inotify_fd(cls) -> int:
@@ -332,6 +368,9 @@ class InotifyFD(BaseThread):
                 callback.on_watch_deleted(wd)
 
     def handle_event(self, event: InotifyEvent) -> None:
+        if event.is_q_overflow:
+            self._handle_queue_overflow()
+            return
         with self._lock:
             if event.is_ignored:
                 # Clean up book-keeping for deleted watches.
@@ -351,6 +390,17 @@ class InotifyFD(BaseThread):
         for callback in delete_callbacks:
             callback.on_watch_deleted(event.wd)
 
+    def _handle_queue_overflow(self) -> None:
+        """Handles an IN_Q_OVERFLOW event: events were lost, so the cookie
+        sequence can no longer be trusted. Bump the instance generation and
+        discard all pending move pairings of registered pairing groups.
+        """
+        self.generation = self._next_generation()
+        with self._lock:
+            groups = list(self._pairing_groups)
+        for group in groups:
+            group.on_queue_overflow()
+
     def read_events(self, *, event_buffer_size: int = DEFAULT_EVENT_BUFFER_SIZE) -> list[InotifyEvent]:
         """
         Reads events from inotify and yields them.
@@ -360,7 +410,7 @@ class InotifyFD(BaseThread):
         return [
             InotifyEvent(wd, mask, cookie, name)
             for wd, mask, cookie, name in InotifyFD._parse_event_buffer(event_buffer)
-            if wd != -1
+            if wd != -1 or mask & InotifyConstants.IN_Q_OVERFLOW
         ]
 
     # Non-synchronized methods.
@@ -604,6 +654,10 @@ class InotifyEvent:
     @property
     def is_ignored(self) -> bool:
         return self.mask & InotifyConstants.IN_IGNORED > 0
+
+    @property
+    def is_q_overflow(self) -> bool:
+        return self.mask & InotifyConstants.IN_Q_OVERFLOW > 0
 
     @property
     def is_directory(self) -> bool:
